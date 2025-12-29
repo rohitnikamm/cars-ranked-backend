@@ -1,0 +1,29 @@
+{
+  "name": "watch-with-me-v2-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "npx tsc && pnpm sentry:sourcemaps",
+    "start": "node dist/app.js",
+    "dev": "npx nodemon ./app.ts",
+    "sentry:sourcemaps": "sentry-cli sourcemaps inject --org synclify --project synclify-server-c2 ./dist && sentry-cli sourcemaps upload --org synclify --project synclify-server-c2 ./dist"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@sentry/cli": "^3.0.1",
+    "@sentry/node": "^10.32.1",
+    "@socket.io/admin-ui": "^0.5.1",
+    "dotenv": "^17.2.3",
+    "socket.io": "^4.8.3",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.56.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "nodemon": "^3.1.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
