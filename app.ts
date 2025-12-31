@@ -41,6 +41,8 @@ app.post("/t", async (res) => {
 		res.onAborted(() => {
 			res.aborted = true;
 		});
+
+		// Allow CORS access to server
 		res.writeHeader("Access-Control-Allow-Origin", "*");
 		res.writeHeader("Access-Control-Allow-Methods", "OPTIONS, POST");
 		res.writeHeader(
@@ -49,8 +51,35 @@ app.post("/t", async (res) => {
 		);
 		res.writeHeader("Access-Control-Max-Age", "3600");
 
+		// Store req as envelope
 		const envelope = await readJson(res);
 
+		// Build Sentry URL and headers
 		const host = process.env.SENTRY_HOST; // domain
-	} catch (error) {}
+		const projectId = process.env.SENTRY_PROJECT_ID;
+		const url = `https://${host}/api/${projectId}/envelope/?sentry_key=${process.env.SENTRY_KEY}`;
+
+		const options = {
+			headers: {
+				"Content-Type": "application/x-sentry-envelope",
+			},
+		};
+
+		// Send response to Sentry
+		const response = await fetch(url, {
+			method: "POST",
+			headers: options.headers,
+			body: envelope
+		});
+
+		// Read Sentry response (ex: OK)
+		const resData = await response.text();
+
+		// Respond to client
+		res.writeStatus("201");
+		res.end(JSON.stringify({ message: "Success", data: resData }));
+	} catch (error) {
+		if (!res.aborted) res.writeStatus("404 Bad Request");
+		res.end(JSON.stringify({ message: "invalid request", error }));
+	}
 });
