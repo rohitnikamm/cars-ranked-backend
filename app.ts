@@ -2,6 +2,7 @@ import { App } from "uWebSockets.js";
 import { Server } from "socket.io";
 import crypto from "crypto";
 import { instrument } from "@socket.io/admin-ui";
+import "dotenv/config";
 
 const app = App();
 const io = new Server({
