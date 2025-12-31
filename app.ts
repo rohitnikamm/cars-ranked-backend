@@ -1,7 +1,7 @@
-import { App, HttpResponse } from "uWebSockets.js";
+import { App } from "uWebSockets.js";
 import { Server } from "socket.io";
 import crypto from "crypto";
-import "./instrument";
+import { instrument } from "@socket.io/admin-ui";
 
 const app = App();
 const io = new Server({
@@ -36,50 +36,53 @@ app.get("/create", (res) => {
 	res.end(code);
 });
 
-app.post("/t", async (res) => {
-	try {
-		res.onAborted(() => {
-			res.aborted = true;
-		});
+// Admin dashboard for Socket.io
+instrument(io, {
+	auth: {
+		type: "basic",
+		username: "admin",
+		password: process.env.ADMIN_PASSWORD as string,
+	},
+});
 
-		// Allow CORS access to server
-		res.writeHeader("Access-Control-Allow-Origin", "*");
-		res.writeHeader("Access-Control-Allow-Methods", "OPTIONS, POST");
-		res.writeHeader(
-			"Access-Control-Allow-Headers",
-			"origin, content-type, accept, x-requested-with",
-		);
-		res.writeHeader("Access-Control-Max-Age", "3600");
+app.listen(3000, () => {
+	console.log("listening on *:3000");
+});
 
-		// Store req as envelope
-		const envelope = await readJson(res);
-
-		// Build Sentry URL and headers
-		const host = process.env.SENTRY_HOST; // domain
-		const projectId = process.env.SENTRY_PROJECT_ID;
-		const url = `https://${host}/api/${projectId}/envelope/?sentry_key=${process.env.SENTRY_KEY}`;
-
-		const options = {
-			headers: {
-				"Content-Type": "application/x-sentry-envelope",
-			},
-		};
-
-		// Send response to Sentry
-		const response = await fetch(url, {
-			method: "POST",
-			headers: options.headers,
-			body: envelope
-		});
-
-		// Read Sentry response (ex: OK)
-		const resData = await response.text();
-
-		// Respond to client
-		res.writeStatus("201");
-		res.end(JSON.stringify({ message: "Success", data: resData }));
-	} catch (error) {
-		if (!res.aborted) res.writeStatus("404 Bad Request");
-		res.end(JSON.stringify({ message: "invalid request", error }));
+io.sockets.on("connection", (socket) => {
+	// Convenience function to log server messages to the client
+	function log(...messages: string[]) {
+		const array = [">>> Message from server: "];
+		for (let i = 0; i < messages.length; i++) {
+			array.push(arguments[i]);
+		}
+		socket.emit("log", array);
 	}
+
+	// Joining and creating rooms
+	socket.on("join", (room) => {
+		const numClients = io.sockets.adapter.rooms.get(room)?.size ?? 0;
+
+		log("Room " + room + " has " + numClients + " client(s)");
+		log("Request to create or join room " + room);
+
+		if (numClients > 1) {
+			socket.emit("full", room);
+		}
+
+		// only one room allowed per socket
+		for (room in socket.rooms) {
+			if (socket.id !== room) socket.leave(room);
+		}
+
+		if (numClients === 0) {
+			socket.join(room);
+			socket.emit("created", room);
+		} else if (numClients === 1) {
+			io.sockets.in(room).emit("join", room);
+			socket.join(room);
+			socket.emit("joined", room);
+		}
+		socket.emit("emit(): client " + socket.id + " joined room " + room);
+	});
 });
