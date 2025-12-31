@@ -15,7 +15,7 @@ io.attachApp(app);
 
 // create room ID
 const random = () =>
-	crypto.randomBytes(20).toString("hex").slice(0, 5).toUpperCase;
+	crypto.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
 
 // Check if room has 0 users (true if 0)
 function isEmpty(room: string) {
