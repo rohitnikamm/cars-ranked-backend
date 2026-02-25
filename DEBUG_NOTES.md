@@ -9,8 +9,8 @@ Socket.io server for CARS Ranked Chrome extension. Handles real-time room manage
 - **uWebSockets.js**: High-performance HTTP server
 - **Socket.io**: Real-time bidirectional communication
 - **TypeScript**: Type safety
-- **ts-node**: Development runtime
-- **nodemon**: Auto-restart on file changes
+- **tsx**: Development runtime (replaced ts-node for better compatibility)
+- **nodemon**: Auto-restart on file changes (`--exec tsx` flag)
 
 ## Key Features
 
@@ -92,6 +92,20 @@ All logs prefixed with `[CARS Ranked]` for easy filtering:
 ## Admin Dashboard
 
 Socket.io Admin UI available at configured endpoint with basic auth.
+
+## Dev Script Change (Session 7)
+
+Switched from `ts-node` to `tsx` for the dev runtime due to compatibility issues:
+
+```json
+// Before
+"dev": "npx nodemon ./app.ts"
+
+// After
+"dev": "npx nodemon --exec tsx ./app.ts"
+```
+
+`tsx` is a faster, more compatible TypeScript runner that handles ESM/CJS interop better than `ts-node`.
 
 ## Known Issues / Future Enhancements
 
