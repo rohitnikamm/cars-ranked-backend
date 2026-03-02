@@ -15,7 +15,10 @@ const io = new Server({
 });
 io.attachApp(app);
 
-// create room ID
+// Room configuration
+const ROOM_MAX_CAPACITY = 2;
+
+// Generate random 5-char room code
 const random = () =>
 	crypto.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
 
@@ -25,24 +28,20 @@ const roomPassages = new Map<
 	{ passageId: string; frameIds: number[]; passageTitle?: string }
 >();
 
+// Rooms waiting for more players
+const waitingRooms = new Set<string>();
+
+// Track which socket is in which room (socketId -> roomId)
+const socketRoom = new Map<string, string>();
+
 // Check if room has 0 users (true if 0)
 function isEmpty(room: string) {
-	return io.sockets.adapter.rooms.get(room)?.size ?? 0 === 0;
+	return (io.sockets.adapter.rooms.get(room)?.size ?? 0) === 0;
 }
 
-// Creates room code and ensures it is empty
-app.get("/create", (res) => {
-	let valid = false;
-	let code = random();
-	while (!valid) {
-		if (isEmpty(code)) {
-			valid = true;
-			break;
-		}
-		code = random();
-	}
-	res.end(code);
-});
+function getRoomSize(room: string) {
+	return io.sockets.adapter.rooms.get(room)?.size ?? 0;
+}
 
 // Store passage info for a room
 app.post("/passage/:roomId", (res, req) => {
@@ -77,6 +76,11 @@ app.post("/passage/:roomId", (res, req) => {
 				console.log(
 					`[CARS Ranked] Stored passage for room ${roomId}: ${passageId}${passageTitle ? ` (${passageTitle})` : ""}`,
 				);
+
+				// Notify all sockets in the room that passage is ready
+				io.sockets
+					.in(roomId)
+					.emit("passageReady", { roomId, passageId, frameIds, passageTitle });
 
 				res.writeStatus("200 OK");
 				res.writeHeader("Content-Type", "application/json");
@@ -137,53 +141,112 @@ app.listen(3000, () => {
 io.sockets.on("connection", (socket) => {
 	console.log(`User connected: ${socket.id}`);
 
-	// Convenience function to log server messages to the client
-	function log(...messages: string[]) {
-		const array = [">>> Message from server: "];
-		for (let i = 0; i < messages.length; i++) {
-			array.push(arguments[i]);
-		}
-		socket.emit("log", array);
-	}
-
-	// Joining and creating rooms
-	socket.on("join", (room) => {
-		const numClients = io.sockets.adapter.rooms.get(room)?.size ?? 0;
-
-		log("Room " + room + " has " + numClients + " client(s)");
-		log("Request to create or join room " + room);
-
-		if (numClients > 1) {
-			socket.emit("full", room);
+	// Matchmaking: find an open room or create a new one
+	socket.on("matchmake", () => {
+		// Prevent double-matchmaking
+		if (socketRoom.has(socket.id)) {
+			socket.emit("error", { message: "Already in matchmaking" });
+			return;
 		}
 
-		// only one room allowed per socket
-		for (room in socket.rooms) {
-			if (socket.id !== room) socket.leave(room);
+		// Find first available waiting room
+		let assignedRoom: string | null = null;
+		for (const roomId of waitingRooms) {
+			const roomSize = getRoomSize(roomId);
+			if (roomSize > 0 && roomSize < ROOM_MAX_CAPACITY) {
+				assignedRoom = roomId;
+				break;
+			} else if (roomSize === 0) {
+				// Stale entry — clean up
+				waitingRooms.delete(roomId);
+				roomPassages.delete(roomId);
+			}
 		}
 
-		if (numClients === 0) {
-			socket.join(room);
-			socket.emit("created", room);
-		} else if (numClients === 1) {
-			io.sockets.in(room).emit("join", room); // broadcast within room
-			socket.join(room);
-			socket.emit("joined", room);
+		if (assignedRoom) {
+			// Join existing room
+			socket.join(assignedRoom);
+			socketRoom.set(socket.id, assignedRoom);
+			waitingRooms.delete(assignedRoom); // Room is now full
+
+			console.log(
+				`[CARS Ranked] Matchmake: ${socket.id} joined existing room ${assignedRoom}`,
+			);
+
+			// Notify both players
+			socket.emit("matched", { roomId: assignedRoom, role: "guest" });
+			socket
+				.to(assignedRoom)
+				.emit("matched", { roomId: assignedRoom, role: "host" });
+		} else {
+			// Create new room
+			let code = random();
+			while (!isEmpty(code)) {
+				code = random();
+			}
+
+			socket.join(code);
+			socketRoom.set(socket.id, code);
+			waitingRooms.add(code);
+
+			console.log(
+				`[CARS Ranked] Matchmake: ${socket.id} created new room ${code}, waiting for opponent`,
+			);
+
+			socket.emit("waiting", { roomId: code });
 		}
-		socket.emit("emit(): client " + socket.id + " joined room " + room);
 	});
 
-	// Clean up passage info when room is empty
+	// Cancel matchmaking
+	socket.on("cancelMatchmake", () => {
+		const roomId = socketRoom.get(socket.id);
+		if (!roomId) return;
+
+		const roomSize = getRoomSize(roomId);
+
+		socket.leave(roomId);
+		socketRoom.delete(socket.id);
+		waitingRooms.delete(roomId);
+		roomPassages.delete(roomId);
+
+		// If someone else was in the room (rare race), notify them
+		if (roomSize > 1) {
+			io.sockets.in(roomId).emit("partnerLeft", { roomId });
+		}
+
+		console.log(
+			`[CARS Ranked] Matchmake cancelled: ${socket.id} left room ${roomId}`,
+		);
+
+		socket.emit("matchmakeCancelled");
+	});
+
+	// Clean up on disconnect
 	socket.on("disconnect", () => {
 		console.log(`User disconnected: ${socket.id}`);
+		const roomId = socketRoom.get(socket.id);
+		socketRoom.delete(socket.id);
 
-		// Check all rooms and clean up empty ones
-		roomPassages.forEach((value, roomId) => {
-			if (isEmpty(roomId)) {
+		if (roomId) {
+			waitingRooms.delete(roomId);
+
+			const roomSize = getRoomSize(roomId);
+			if (roomSize === 0) {
 				roomPassages.delete(roomId);
+				console.log(`[CARS Ranked] Cleaned up empty room ${roomId}`);
+			} else if (roomSize < ROOM_MAX_CAPACITY) {
+				// Partner left — notify remaining players
+				io.sockets.in(roomId).emit("partnerLeft", { roomId });
 				console.log(
-					`[CARS Ranked] Cleaned up passage for empty room ${roomId}`,
+					`[CARS Ranked] Partner left room ${roomId}, notified remaining players`,
 				);
+			}
+		}
+
+		// Safety net: clean up any orphaned roomPassages
+		roomPassages.forEach((_, rid) => {
+			if (isEmpty(rid)) {
+				roomPassages.delete(rid);
 			}
 		});
 	});
