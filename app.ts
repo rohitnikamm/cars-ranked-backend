@@ -17,6 +17,7 @@ io.attachApp(app);
 
 // Room configuration
 const ROOM_MAX_CAPACITY = 2;
+const COUNTDOWN_MS = 5000;
 
 // Generate random 5-char room code
 const random = () =>
@@ -141,6 +142,11 @@ app.listen(3000, () => {
 io.sockets.on("connection", (socket) => {
 	console.log(`User connected: ${socket.id}`);
 
+	// Clock synchronization: echo client's t0 + add server timestamp
+	socket.on("clockSync", ({ t0 }: { t0: number }) => {
+		socket.emit("clockSyncResponse", { t0, t1: Date.now() });
+	});
+
 	// Matchmaking: find an open room or create a new one
 	socket.on("matchmake", () => {
 		// Prevent double-matchmaking
@@ -173,11 +179,12 @@ io.sockets.on("connection", (socket) => {
 				`[CARS Ranked] Matchmake: ${socket.id} joined existing room ${assignedRoom}`,
 			);
 
-			// Notify both players
-			socket.emit("matched", { roomId: assignedRoom, role: "guest" });
+			// Notify both players with same absolute countdown target
+			const countdownEndAt = Date.now() + COUNTDOWN_MS;
+			socket.emit("matched", { roomId: assignedRoom, role: "guest", countdownEndAt });
 			socket
 				.to(assignedRoom)
-				.emit("matched", { roomId: assignedRoom, role: "host" });
+				.emit("matched", { roomId: assignedRoom, role: "host", countdownEndAt });
 		} else {
 			// Create new room
 			let code = random();

@@ -25,7 +25,7 @@ This backend is part of a monorepo:
 
 ```
 cars-ranked-backend/
-├── app.ts                     # Main server file (HTTP + Socket.io) ~190 lines
+├── app.ts                     # Main server file (HTTP + Socket.io) ~261 lines
 ├── tsconfig.json              # TypeScript configuration
 ├── package.json               # Dependencies and scripts
 ├── package-lock.json          # Locked dependency versions
@@ -219,10 +219,24 @@ io.sockets.on("connection", (socket) => {
   console.log(`User connected: ${socket.id}`);
 
   // Define event handlers:
-  socket.on("join", ...)
+  socket.on("clockSync", ...)    // NTP-style clock sync
+  socket.on("matchmake", ...)    // Auto-matchmaking
+  socket.on("cancelMatchmake", ...)
   socket.on("disconnect", ...)
 });
 ```
+
+---
+
+#### Client → Server: `clockSync`
+
+NTP-style clock synchronization. Client sends its local timestamp; server echoes it back with the server's timestamp. Client uses the round-trip to estimate clock offset.
+
+**Payload**: `{ t0: number }` — client's `Date.now()` at send time
+
+**Server Response**: Emits `clockSyncResponse` with `{ t0, t1: Date.now() }`
+
+**Usage**: Client runs 3 rounds on connect, takes median offset. Used to convert server-time `countdownEndAt` to local time for synchronized countdowns.
 
 ---
 
@@ -307,6 +321,74 @@ Debug messages from server to client console.
 ```
 
 **Extension Handler**: Content script logs to browser console.
+
+---
+
+#### Client → Server: `matchmake`
+
+Auto-matchmaking: finds an open waiting room or creates a new one.
+
+**Payload**: None
+
+**Server Logic**:
+
+```typescript
+1. Check if socket already in a room (prevent double-matchmake)
+2. Search waitingRooms for room with 1 player and < ROOM_MAX_CAPACITY
+3. If found:
+   - socket.join(room), compute countdownEndAt = Date.now() + COUNTDOWN_MS
+   - emit "matched" { roomId, role: "guest", countdownEndAt } to joining player
+   - emit "matched" { roomId, role: "host", countdownEndAt } to waiting player
+4. If not found:
+   - Create new room, socket.join(room), add to waitingRooms
+   - emit "waiting" { roomId }
+```
+
+**Constants**: `ROOM_MAX_CAPACITY = 2`, `COUNTDOWN_MS = 5000`
+
+---
+
+#### Client → Server: `cancelMatchmake`
+
+Cancel matchmaking or exit a room.
+
+**Payload**: None
+
+**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/roomPassages, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
+
+---
+
+#### Server → Client: `matched`
+
+Emitted to both players when a room becomes full.
+
+**Payload**: `{ roomId: string, role: "host" | "guest", countdownEndAt: number }`
+
+- `countdownEndAt`: Absolute server timestamp (`Date.now() + COUNTDOWN_MS`). Both players receive the same value. Clients convert to local time using their clock offset for synchronized countdowns.
+
+---
+
+#### Server → Client: `waiting`
+
+Emitted when no open rooms exist; player is waiting for an opponent.
+
+**Payload**: `{ roomId: string }`
+
+---
+
+#### Server → Client: `partnerLeft`
+
+Emitted when a player's partner disconnects from the room.
+
+**Payload**: `{ roomId: string }`
+
+---
+
+#### Server → Client: `passageReady`
+
+Emitted to all sockets in a room when the host uploads passage data via `POST /passage/:roomId`.
+
+**Payload**: `{ roomId, passageId, frameIds, passageTitle, passageHref }`
 
 ---
 
