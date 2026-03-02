@@ -25,7 +25,7 @@ const random = () =>
 // Store passage information per room
 const roomPassages = new Map<
 	string,
-	{ passageId: string; frameIds: number[]; passageTitle?: string }
+	{ passageId: string; frameIds: number[]; passageTitle?: string; passageHref?: string }
 >();
 
 // Rooms waiting for more players
@@ -62,7 +62,7 @@ app.post("/passage/:roomId", (res, req) => {
 		if (isLast) {
 			try {
 				const body = JSON.parse(buffer.toString());
-				const { passageId, frameIds, passageTitle } = body;
+				const { passageId, frameIds, passageTitle, passageHref } = body;
 
 				if (!passageId || !frameIds) {
 					res.writeStatus("400 Bad Request");
@@ -72,7 +72,7 @@ app.post("/passage/:roomId", (res, req) => {
 					return;
 				}
 
-				roomPassages.set(roomId, { passageId, frameIds, passageTitle });
+				roomPassages.set(roomId, { passageId, frameIds, passageTitle, passageHref });
 				console.log(
 					`[CARS Ranked] Stored passage for room ${roomId}: ${passageId}${passageTitle ? ` (${passageTitle})` : ""}`,
 				);
@@ -80,7 +80,7 @@ app.post("/passage/:roomId", (res, req) => {
 				// Notify all sockets in the room that passage is ready
 				io.sockets
 					.in(roomId)
-					.emit("passageReady", { roomId, passageId, frameIds, passageTitle });
+					.emit("passageReady", { roomId, passageId, frameIds, passageTitle, passageHref });
 
 				res.writeStatus("200 OK");
 				res.writeHeader("Content-Type", "application/json");
