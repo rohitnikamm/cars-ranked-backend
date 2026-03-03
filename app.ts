@@ -143,6 +143,28 @@ app.listen(PORT, () => {
 	console.log(`listening on *:${PORT}`);
 });
 
+// Periodic stale room sweeper — catches zombie rooms where sockets died
+// without a clean disconnect (e.g. network drop before pingTimeout fires)
+setInterval(() => {
+	let cleaned = 0;
+	for (const [roomId] of roomPassages) {
+		if (isEmpty(roomId)) {
+			roomPassages.delete(roomId);
+			roomFinishTimes.delete(roomId);
+			cleaned++;
+		}
+	}
+	for (const roomId of waitingRooms) {
+		if (isEmpty(roomId)) {
+			waitingRooms.delete(roomId);
+			cleaned++;
+		}
+	}
+	if (cleaned > 0) {
+		console.log(`[CARS Ranked] Periodic cleanup: removed ${cleaned} stale entries`);
+	}
+}, 60_000);
+
 io.sockets.on("connection", (socket) => {
 	console.log(`User connected: ${socket.id}`);
 
