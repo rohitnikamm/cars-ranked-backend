@@ -25,7 +25,7 @@ This backend is part of a monorepo:
 
 ```
 cars-ranked-backend/
-├── app.ts                     # Main server file (HTTP + Socket.io) ~261 lines
+├── app.ts                     # Main server file (HTTP + Socket.io) ~307 lines
 ├── tsconfig.json              # TypeScript configuration
 ├── package.json               # Dependencies and scripts
 ├── package-lock.json          # Locked dependency versions
@@ -88,6 +88,7 @@ type PassageInfo = {
     passageId: string; // Jack Westin passage ID (e.g., "passage-123")
     frameIds: number[]; // Browser frame IDs where passage exists
     passageTitle?: string; // Human-readable passage title
+    passageHref?: string; // Passage anchor href for navigation
 };
 ```
 
@@ -96,6 +97,18 @@ type PassageInfo = {
 - Created when first user stores passage (`POST /passage/:roomId`)
 - Retrieved when second user joins (`GET /passage/:roomId`)
 - Deleted when room becomes empty (on `disconnect` event)
+
+**`roomFinishTimes: Map<roomId, Map<socketId, elapsedMs>>`**
+
+Tracks per-room player finish times for coordinating results.
+
+**Lifecycle**:
+
+- Created when first player in room emits `playerFinished`
+- When both players finish (`finishMap.size >= ROOM_MAX_CAPACITY`), personalized `resultsReady` events are emitted
+- Deleted on: `cancelMatchmake`, `disconnect` (when room empties), and safety net cleanup
+
+**Other Maps**: `waitingRooms: Set<roomId>` (rooms with 1 player), `socketRoom: Map<socketId, roomId>` (for cleanup)
 
 **Important**: State is **not persisted** to disk. Server restart clears all rooms.
 
@@ -219,10 +232,11 @@ io.sockets.on("connection", (socket) => {
   console.log(`User connected: ${socket.id}`);
 
   // Define event handlers:
-  socket.on("clockSync", ...)    // NTP-style clock sync
-  socket.on("matchmake", ...)    // Auto-matchmaking
-  socket.on("cancelMatchmake", ...)
-  socket.on("disconnect", ...)
+  socket.on("clockSync", ...)        // NTP-style clock sync
+  socket.on("matchmake", ...)        // Auto-matchmaking
+  socket.on("cancelMatchmake", ...)  // Cancel matchmaking
+  socket.on("playerFinished", ...)   // Player finished test → store time, emit results
+  socket.on("disconnect", ...)       // Cleanup rooms/state
 });
 ```
 
@@ -354,7 +368,7 @@ Cancel matchmaking or exit a room.
 
 **Payload**: None
 
-**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/roomPassages, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
+**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/roomPassages/roomFinishTimes, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
 
 ---
 
@@ -392,6 +406,44 @@ Emitted to all sockets in a room when the host uploads passage data via `POST /p
 
 ---
 
+#### Client → Server: `playerFinished`
+
+Player finished the test. Server stores the elapsed time and coordinates results.
+
+**Payload**: `{ roomId: string, elapsedMs: number }`
+
+**Server Logic**:
+
+```typescript
+1. Validate socket is in this room via socketRoom
+2. Validate elapsedMs is a positive number
+3. Prevent duplicate submissions (finishMap.has(socket.id))
+4. Store { socketId: elapsedMs } in roomFinishTimes
+5. If finishMap.size >= ROOM_MAX_CAPACITY (both players done):
+   - Emit "resultsReady" to EACH socket with personalized times:
+     { roomId, myElapsedMs: <their time>, opponentElapsedMs: <other's time> }
+6. If finishMap.size < ROOM_MAX_CAPACITY (first player):
+   - Emit "playerFinished" { roomId } to opponent (no time revealed)
+```
+
+---
+
+#### Server → Client: `playerFinished`
+
+Emitted to the opponent when the first player finishes the test. Does not reveal the finisher's time.
+
+**Payload**: `{ roomId: string }`
+
+---
+
+#### Server → Client: `resultsReady`
+
+Emitted individually to each socket when both players have finished. Each player receives personalized results.
+
+**Payload**: `{ roomId: string, myElapsedMs: number, opponentElapsedMs: number }`
+
+---
+
 #### Client → Server: `disconnect`
 
 Triggered when a client disconnects (browser close, network loss, etc.).
@@ -400,13 +452,15 @@ Triggered when a client disconnects (browser close, network loss, etc.).
 
 ```typescript
 1. Log: "User disconnected: {socket.id}"
-2. Iterate through roomPassages Map
-3. For each room, check if empty: isEmpty(roomId)
-4. If empty, delete from Map: roomPassages.delete(roomId)
-5. Log: "[CARS Ranked] Cleaned up passage for empty room {roomId}"
+2. Look up room via socketRoom, clean up socketRoom entry
+3. If room found:
+   a. Remove from waitingRooms
+   b. If room empty: delete roomPassages and roomFinishTimes for that room
+   c. If room has remaining players (< capacity): emit "partnerLeft" to them
+4. Safety net: iterate roomPassages and roomFinishTimes Maps, delete entries for empty rooms
 ```
 
-**Critical**: This is the **only cleanup mechanism**. Rooms are deleted when all users leave.
+**Critical**: This is the **primary cleanup mechanism**. All in-memory state (roomPassages, roomFinishTimes, waitingRooms, socketRoom) is cleaned up when rooms become empty.
 
 ---
 
@@ -638,6 +692,28 @@ if (numClients > 1) {
 ```
 
 **Important**: No orphaned rooms. All state is ephemeral.
+
+### Timer & Results Lifecycle
+
+```
+1. Player clicks "End Test" in browser
+   → Extension emits playerFinished { roomId, elapsedMs }
+   → Server stores in roomFinishTimes[roomId][socketId] = elapsedMs
+
+2. If first player to finish:
+   → Server emits "playerFinished" { roomId } to opponent (no time)
+   → Opponent's extension shows "Waiting for opponent..."
+
+3. If second player to finish (finishMap.size >= ROOM_MAX_CAPACITY):
+   → Server emits personalized "resultsReady" to EACH socket:
+     Socket A: { myElapsedMs: A_time, opponentElapsedMs: B_time }
+     Socket B: { myElapsedMs: B_time, opponentElapsedMs: A_time }
+   → Both extensions show Final Results screen
+
+4. If opponent disconnects before finishing:
+   → Extension handles via "partnerLeft" event
+   → If player already finished, shows results with opponentElapsedMs: -1 (DNF)
+```
 
 ---
 

@@ -35,6 +35,9 @@ const waitingRooms = new Set<string>();
 // Track which socket is in which room (socketId -> roomId)
 const socketRoom = new Map<string, string>();
 
+// Track player finish times per room: roomId -> Map<socketId, elapsedMs>
+const roomFinishTimes = new Map<string, Map<string, number>>();
+
 // Check if room has 0 users (true if 0)
 function isEmpty(room: string) {
 	return (io.sockets.adapter.rooms.get(room)?.size ?? 0) === 0;
@@ -215,6 +218,7 @@ io.sockets.on("connection", (socket) => {
 		socketRoom.delete(socket.id);
 		waitingRooms.delete(roomId);
 		roomPassages.delete(roomId);
+		roomFinishTimes.delete(roomId);
 
 		// If someone else was in the room (rare race), notify them
 		if (roomSize > 1) {
@@ -226,6 +230,42 @@ io.sockets.on("connection", (socket) => {
 		);
 
 		socket.emit("matchmakeCancelled");
+	});
+
+	// Player finished the test
+	socket.on("playerFinished", ({ roomId, elapsedMs }: { roomId: string; elapsedMs: number }) => {
+		const actualRoom = socketRoom.get(socket.id);
+		if (!actualRoom || actualRoom !== roomId) return;
+		if (typeof elapsedMs !== "number" || elapsedMs <= 0) return;
+
+		if (!roomFinishTimes.has(roomId)) {
+			roomFinishTimes.set(roomId, new Map());
+		}
+		const finishMap = roomFinishTimes.get(roomId)!;
+
+		// Prevent duplicate submissions
+		if (finishMap.has(socket.id)) return;
+
+		finishMap.set(socket.id, elapsedMs);
+		console.log(`[CARS Ranked] Player ${socket.id} finished in room ${roomId}: ${elapsedMs}ms`);
+
+		if (finishMap.size >= ROOM_MAX_CAPACITY) {
+			// Both players finished — send personalized results to each
+			const entries = Array.from(finishMap.entries());
+			for (const [sid, time] of entries) {
+				const opponentTime = entries.find(([s]) => s !== sid)?.[1] ?? 0;
+				io.sockets.sockets.get(sid)?.emit("resultsReady", {
+					roomId,
+					myElapsedMs: time,
+					opponentElapsedMs: opponentTime,
+				});
+			}
+			console.log(`[CARS Ranked] Results sent for room ${roomId}`);
+		} else {
+			// First player finished — notify opponent (no time revealed)
+			socket.to(roomId).emit("playerFinished", { roomId });
+			console.log(`[CARS Ranked] Notified opponent in room ${roomId} that a player finished`);
+		}
 	});
 
 	// Clean up on disconnect
@@ -240,6 +280,7 @@ io.sockets.on("connection", (socket) => {
 			const roomSize = getRoomSize(roomId);
 			if (roomSize === 0) {
 				roomPassages.delete(roomId);
+				roomFinishTimes.delete(roomId);
 				console.log(`[CARS Ranked] Cleaned up empty room ${roomId}`);
 			} else if (roomSize < ROOM_MAX_CAPACITY) {
 				// Partner left — notify remaining players
@@ -250,10 +291,15 @@ io.sockets.on("connection", (socket) => {
 			}
 		}
 
-		// Safety net: clean up any orphaned roomPassages
+		// Safety net: clean up any orphaned maps
 		roomPassages.forEach((_, rid) => {
 			if (isEmpty(rid)) {
 				roomPassages.delete(rid);
+			}
+		});
+		roomFinishTimes.forEach((_, rid) => {
+			if (isEmpty(rid)) {
+				roomFinishTimes.delete(rid);
 			}
 		});
 	});
