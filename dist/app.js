@@ -109,8 +109,9 @@ app.get("/passage/:roomId", (res, req) => {
         password: process.env.ADMIN_PASSWORD,
     },
 });
-app.listen(3000, () => {
-    console.log("listening on *:3000");
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, () => {
+    console.log(`listening on *:${PORT}`);
 });
 io.sockets.on("connection", (socket) => {
     console.log(`User connected: ${socket.id}`);
