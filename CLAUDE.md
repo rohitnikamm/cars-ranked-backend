@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## Project Overview
 
-CARS Ranked Backend is a Node.js server that provides HTTP REST API and Socket.io WebSocket functionality for the CARS Ranked browser extension. It manages room creation, passage synchronization, and real-time user coordination for MCAT CARS study sessions.
+CARS Ranked Backend is a Node.js server that provides HTTP REST API and Socket.io WebSocket functionality for the CARS Ranked browser extension. It manages ELO-filtered matchmaking, room creation, passage synchronization, and real-time user coordination for MCAT CARS study sessions.
 
-**Purpose**: Coordinate synchronized passage selection between multiple browser extension clients, ensuring all users in a room work on the same passage.
+**Purpose**: Coordinate ELO-filtered matchmaking (±15 ELO for ranked, first-come-first-served for casual) and synchronized passage selection between multiple browser extension clients. Server fetches ELO from Supabase (tamper-proof) and enforces a 30-second matchmaking timeout.
 
 ---
 
@@ -147,11 +147,31 @@ Tracks authenticated user identity per socket for ELO updates.
 - Set when client emits `matchmake` with `{ userId, displayName }`
 - Deleted on `cancelMatchmake` and `disconnect`
 
-**Other Maps**: `waitingRooms: Set<roomId>` (rooms with 1 player), `socketRoom: Map<socketId, roomId>` (for cleanup)
+**`waitingRooms: Map<roomId, WaitingEntry>`**
+
+Tracks rooms with 1 player waiting for a match (used by matchmaking with ELO filtering).
+
+```typescript
+type MatchType = "ranked" | "casual";
+
+type WaitingEntry = {
+    socketId: string;           // Waiting player's socket ID
+    elo: number;                // Player's ELO (fetched server-side from Supabase)
+    matchType: MatchType;       // "ranked" (±15 ELO filter) or "casual" (no filter)
+    timeoutHandle: ReturnType<typeof setTimeout>;  // 30s matchmake timeout
+};
+```
+
+**Lifecycle**:
+- Created when no compatible room exists during `matchmake` → starts 30s timeout
+- Consumed when a compatible player matches → `clearTimeout` + delete entry
+- Deleted + `clearTimeout` on: `cancelMatchmake`, `disconnect`, timeout expiry, periodic sweeper
+
+**Other Maps**: `socketRoom: Map<socketId, roomId>` (for cleanup)
 
 **Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column.
 
-**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, and `roomEloResults` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms`. Catches zombie rooms where sockets died without clean TCP teardown.
+**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, and `roomEloResults` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms` (calls `clearTimeout` on each stale entry's timeout handle before deleting). Catches zombie rooms where sockets died without clean TCP teardown.
 
 **Important**: In-memory state is **not persisted** to disk. Server restart clears all rooms. ELO is persisted in Supabase `profiles` table.
 
@@ -383,26 +403,34 @@ Debug messages from server to client console.
 
 #### Client → Server: `matchmake`
 
-Auto-matchmaking: finds an open waiting room or creates a new one.
+Auto-matchmaking with ELO-filtered matching: finds a compatible waiting room or creates a new one with a 30s timeout.
 
-**Payload**: `{ userId?: string, displayName?: string }` — user identity for ELO tracking (stored in `socketUser` map)
+**Payload**: `{ userId?: string, displayName?: string, matchType?: MatchType }` — user identity for ELO tracking (stored in `socketUser` map); `matchType` defaults to `"ranked"`
 
 **Server Logic**:
 
 ```typescript
 1. Store userId/displayName in socketUser map (if provided)
 2. Check if socket already in a room (prevent double-matchmake)
-3. Search waitingRooms for room with 1 player and < ROOM_MAX_CAPACITY
-4. If found:
+3. Fetch player's authoritative ELO from Supabase (tamper-proof): profiles.elo (default 472)
+4. Search waitingRooms for compatible room:
+   - Must match matchType
+   - For ranked: bidirectional ±ELO_RANGE check (Math.abs(playerElo - entry.elo) <= 15)
+   - For casual (future): no ELO filter
+   - Clean up stale entries (roomSize === 0) during iteration
+5. If compatible room found:
+   - clearTimeout(waitingEntry.timeoutHandle) — cancel waiting player's 30s timer
    - socket.join(room), compute countdownEndAt = Date.now() + COUNTDOWN_MS
    - emit "matched" { roomId, role: "guest", countdownEndAt } to joining player
    - emit "matched" { roomId, role: "host", countdownEndAt } to waiting player
-4. If not found:
-   - Create new room, socket.join(room), add to waitingRooms
+6. If no compatible room:
+   - Create new room, socket.join(room)
+   - Start 30s timeout → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
+   - Store WaitingEntry { socketId, elo, matchType, timeoutHandle } in waitingRooms
    - emit "waiting" { roomId }
 ```
 
-**Constants**: `ROOM_MAX_CAPACITY = 2`, `COUNTDOWN_MS = 5000`
+**Constants**: `ROOM_MAX_CAPACITY = 2`, `COUNTDOWN_MS = 5000`, `MATCHMAKE_TIMEOUT_MS = 30_000`, `ELO_RANGE = 15`
 
 ---
 
@@ -412,7 +440,7 @@ Cancel matchmaking or exit a room.
 
 **Payload**: None
 
-**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes/roomEloResults, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
+**Server Logic**: Calls `clearTimeout` on any waiting entry's timeout handle, removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes/roomEloResults, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
 
 ---
 
@@ -428,7 +456,15 @@ Emitted to both players when a room becomes full.
 
 #### Server → Client: `waiting`
 
-Emitted when no open rooms exist; player is waiting for an opponent.
+Emitted when no compatible waiting room exists; player is waiting for an opponent. A 30s server-side timeout starts.
+
+**Payload**: `{ roomId: string }`
+
+---
+
+#### Server → Client: `matchmakeTimeout`
+
+Emitted when 30 seconds elapse with no compatible match found (±15 ELO for ranked). Server cleans up the room, socket leaves room, and all maps are cleared.
 
 **Payload**: `{ roomId: string }`
 
@@ -548,9 +584,10 @@ Triggered when a client disconnects (browser close, network loss, etc.).
 1. Log: "User disconnected: {socket.id}"
 2. Look up room via socketRoom, clean up socketRoom and socketUser entries
 3. If room found:
-   a. Remove from waitingRooms
-   b. If room empty: delete roomPassages, roomFinishTimes, and roomEloResults for that room
-   c. If room has remaining players (< capacity): emit "partnerLeft" to them
+   a. clearTimeout on any waitingRooms entry for this room (prevent orphaned timers)
+   b. Remove from waitingRooms
+   c. If room empty: delete roomPassages, roomFinishTimes, and roomEloResults for that room
+   d. If room has remaining players (< capacity): emit "partnerLeft" to them
 4. Safety net: iterate roomPassages, roomFinishTimes, and roomEloResults Maps, delete entries for empty rooms
 ```
 
@@ -700,17 +737,9 @@ ADMIN_PASSWORD="$2a$10$..."
 
 ### Port
 
-**Hardcoded**: Port **3000** in `app.listen(3000)`.
+**Default**: Port **3000** via `const PORT = Number(process.env.PORT) || 3000`.
 
-**To Change**:
-
-```typescript
-// app.ts line 133
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`listening on *:${PORT}`);
-});
-```
+**To Change**: Set `PORT` environment variable in `.env`.
 
 **Extension Update Required**:
 
