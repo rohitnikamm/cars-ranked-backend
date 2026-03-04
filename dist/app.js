@@ -1,4 +1,3 @@
-"use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -8,20 +7,16 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const crypto_1 = __importDefault(require("crypto"));
-const admin_ui_1 = require("@socket.io/admin-ui");
-const supabase_js_1 = require("@supabase/supabase-js");
-const socket_io_1 = require("socket.io");
-const uWebSockets_js_1 = require("uWebSockets.js");
-require("dotenv/config");
+import crypto from "crypto";
+import { instrument } from "@socket.io/admin-ui";
+import { createClient } from "@supabase/supabase-js";
+import { Server } from "socket.io";
+import { App } from "uWebSockets.js";
+import "dotenv/config";
 // Supabase admin client (service role — bypasses RLS)
-const supabaseAdmin = (0, supabase_js_1.createClient)(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-const app = (0, uWebSockets_js_1.App)();
-const io = new socket_io_1.Server({
+const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const app = App();
+const io = new Server({
     cors: {
         origin: true,
         credentials: true,
@@ -35,7 +30,7 @@ const COUNTDOWN_MS = 5000;
 const MATCHMAKE_TIMEOUT_MS = 30000;
 const ELO_RANGE = 15;
 // Generate random 5-char room code
-const random = () => crypto_1.default.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
+const random = () => crypto.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
 // Store passage information per room
 const roomPassages = new Map();
 const waitingRooms = new Map();
@@ -259,7 +254,7 @@ app.get("/passage/:roomId", (res, req) => {
     res.end(JSON.stringify(passageInfo));
 });
 // Admin dashboard for Socket.io
-(0, admin_ui_1.instrument)(io, {
+instrument(io, {
     auth: {
         type: "basic",
         username: "admin",

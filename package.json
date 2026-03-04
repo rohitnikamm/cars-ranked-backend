@@ -5,10 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "build": "npx tsc && pnpm sentry:sourcemaps",
+    "build": "npx tsc",
     "start": "node dist/app.js",
     "dev": "npx nodemon --exec tsx ./app.ts",
-    "sentry:sourcemaps": "sentry-cli sourcemaps inject --org synclify --project synclify-server-c2 ./dist && sentry-cli sourcemaps upload --org synclify --project synclify-server-c2 ./dist"
+    "build:full": "npx tsc && npx sentry-cli sourcemaps inject --org synclify --project synclify-server-c2 ./dist && npx sentry-cli sourcemaps upload --org synclify --project synclify-server-c2 ./dist"
   },
   "keywords": [],
   "author": "",
