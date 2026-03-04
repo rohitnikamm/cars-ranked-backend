@@ -25,7 +25,7 @@ This backend is part of a monorepo:
 
 ```
 cars-ranked-backend/
-├── app.ts                     # Main server file (HTTP + Socket.io + ELO) ~400 lines
+├── app.ts                     # Main server file (HTTP + Socket.io + ELO + accuracy tracking) ~500 lines
 ├── tsconfig.json              # TypeScript configuration
 ├── package.json               # Dependencies and scripts
 ├── package-lock.json          # Locked dependency versions
@@ -99,15 +99,45 @@ type PassageInfo = {
 - Retrieved when second user joins (`GET /passage/:roomId`)
 - Deleted when room becomes empty (on `disconnect` event)
 
-**`roomFinishTimes: Map<roomId, Map<socketId, elapsedMs>>`**
+**`roomFinishTimes: Map<roomId, Map<socketId, PlayerFinishData>>`**
 
-Tracks per-room player finish times for coordinating results.
+Tracks per-room player finish data (time + accuracy) for coordinating results.
+
+```typescript
+type PlayerFinishData = {
+    elapsedMs: number;
+    accuracy: number | null;   // correct / total * 100 (null if scrape failed)
+    correct: number | null;
+    incorrect: number | null;
+    incomplete: number | null;
+};
+```
 
 **Lifecycle**:
 
 - Created when first player in room emits `playerFinished`
 - When both players finish (`finishMap.size >= ROOM_MAX_CAPACITY`), personalized `resultsReady` events are emitted
-- Deleted on: `cancelMatchmake`, `disconnect` (when room empties), and safety net cleanup
+- Deleted on: `cancelMatchmake`, `disconnect` (when room empties), periodic 60s sweeper, and safety net cleanup
+
+**`roomEloResults: Map<roomId, Record<socketId, EloResult>>`**
+
+Pre-computed ELO results for the 100% guaranteed-win early finish case. When the first player finishes with 100% accuracy, they're a guaranteed winner — ELO is computed and stored here immediately so it can be included in the second player's `resultsReady` when they finish.
+
+```typescript
+type EloResult = {
+    displayName: string;
+    oldElo: number;
+    newElo: number;
+    rank: string;
+    newRank: string;
+};
+```
+
+**Lifecycle**:
+
+- Created when first player finishes with 100% accuracy (via `processEloGuaranteed()`)
+- Consumed when second player finishes (sent in `resultsReady` to loser + `opponentResults` to winner)
+- Deleted after consumption, or on: `cancelMatchmake`, `disconnect` (when room empties), periodic 60s sweeper, and safety net cleanup
 
 **`socketUser: Map<socketId, { userId: string, displayName: string }>`**
 
@@ -119,7 +149,9 @@ Tracks authenticated user identity per socket for ELO updates.
 
 **Other Maps**: `waitingRooms: Set<roomId>` (rooms with 1 player), `socketRoom: Map<socketId, roomId>` (for cleanup)
 
-**Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` to read/write `profiles.elo` column.
+**Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column.
+
+**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, and `roomEloResults` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms`. Catches zombie rooms where sockets died without clean TCP teardown.
 
 **Important**: In-memory state is **not persisted** to disk. Server restart clears all rooms. ELO is persisted in Supabase `profiles` table.
 
@@ -380,7 +412,7 @@ Cancel matchmaking or exit a room.
 
 **Payload**: None
 
-**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
+**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes/roomEloResults, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
 
 ---
 
@@ -420,9 +452,9 @@ Emitted to all sockets in a room when the host uploads passage data via `POST /p
 
 #### Client → Server: `playerFinished`
 
-Player finished the test. Server stores the elapsed time and coordinates results.
+Player finished the test. Server stores time + accuracy data and coordinates results.
 
-**Payload**: `{ roomId: string, elapsedMs: number }`
+**Payload**: `{ roomId: string, elapsedMs: number, accuracy: number | null, correct: number | null, incorrect: number | null, incomplete: number | null }`
 
 **Server Logic**:
 
@@ -430,13 +462,20 @@ Player finished the test. Server stores the elapsed time and coordinates results
 1. Validate socket is in this room via socketRoom
 2. Validate elapsedMs is a positive number
 3. Prevent duplicate submissions (finishMap.has(socket.id))
-4. Store { socketId: elapsedMs } in roomFinishTimes
+4. Store PlayerFinishData { elapsedMs, accuracy, correct, incorrect, incomplete } in roomFinishTimes
 5. If finishMap.size >= ROOM_MAX_CAPACITY (both players done):
-   - Call processEloUpdate(): fetch ELO from Supabase, determine winner,
-     compute new ELO (rank-specific deltas), update DB
-   - Emit "resultsReady" to EACH socket with personalized times + ELO data
+   a. Check roomEloResults for pre-computed ELO (100% early finish case):
+      - If exists: send "resultsReady" to second player (loser) with full data;
+        send "opponentResults" to first player (winner) with opponent's accuracy/time
+      - If not: call processEloUpdate() (accuracy-first winner determination),
+        emit "resultsReady" to EACH socket with personalized times + accuracy + ELO
 6. If finishMap.size < ROOM_MAX_CAPACITY (first player):
-   - Emit "playerFinished" { roomId } to opponent (no time revealed)
+   a. If accuracy === 100: guaranteed winner
+      - Call processEloGuaranteed(): compute & update DB for both immediately
+      - Store pre-computed ELO in roomEloResults
+      - Emit "resultsReady" to winner immediately (opponentElapsedMs: -2 = still playing)
+   b. If accuracy < 100 or null: can't determine winner yet
+      - Emit "playerFinished" { roomId } to opponent (no details revealed)
 ```
 
 ---
@@ -451,14 +490,20 @@ Emitted to the opponent when the first player finishes the test. Does not reveal
 
 #### Server → Client: `resultsReady`
 
-Emitted individually to each socket when both players have finished. Each player receives personalized results with ELO data.
+Emitted individually to each socket when results are available. Each player receives personalized results with accuracy and ELO data. In the 100% early finish case, sent to the winner immediately (with `opponentElapsedMs: -2`) and to the loser when they finish.
 
 **Payload**:
 ```typescript
 {
   roomId: string,
   myElapsedMs: number,
-  opponentElapsedMs: number,
+  opponentElapsedMs: number,     // -2 = opponent still playing (100% early case)
+  // Accuracy data
+  myAccuracy: number | null,     // correct / total * 100
+  opponentAccuracy: number | null,
+  opponentCorrect: number | null,
+  opponentIncorrect: number | null,
+  opponentIncomplete: number | null,
   // ELO data (null if ELO processing failed)
   myDisplayName: string,
   myOldElo: number | null,
@@ -475,6 +520,24 @@ Emitted individually to each socket when both players have finished. Each player
 
 ---
 
+#### Server → Client: `opponentResults`
+
+Sent to the 100% winner when their opponent finishes later. Fills in the opponent's accuracy and time data that was pending (shown as "Still playing..." in the winner's UI).
+
+**Payload**:
+```typescript
+{
+  roomId: string,
+  opponentElapsedMs: number,
+  opponentAccuracy: number | null,
+  opponentCorrect: number | null,
+  opponentIncorrect: number | null,
+  opponentIncomplete: number | null,
+}
+```
+
+---
+
 #### Client → Server: `disconnect`
 
 Triggered when a client disconnects (browser close, network loss, etc.).
@@ -486,12 +549,12 @@ Triggered when a client disconnects (browser close, network loss, etc.).
 2. Look up room via socketRoom, clean up socketRoom and socketUser entries
 3. If room found:
    a. Remove from waitingRooms
-   b. If room empty: delete roomPassages and roomFinishTimes for that room
+   b. If room empty: delete roomPassages, roomFinishTimes, and roomEloResults for that room
    c. If room has remaining players (< capacity): emit "partnerLeft" to them
-4. Safety net: iterate roomPassages and roomFinishTimes Maps, delete entries for empty rooms
+4. Safety net: iterate roomPassages, roomFinishTimes, and roomEloResults Maps, delete entries for empty rooms
 ```
 
-**Critical**: This is the **primary cleanup mechanism**. All in-memory state (roomPassages, roomFinishTimes, waitingRooms, socketRoom) is cleaned up when rooms become empty.
+**Critical**: This is the **primary cleanup mechanism**. All in-memory state (roomPassages, roomFinishTimes, roomEloResults, waitingRooms, socketRoom) is cleaned up when rooms become empty.
 
 ---
 
@@ -730,22 +793,34 @@ if (numClients > 1) {
 
 ```
 1. Player clicks "End Test" in browser
-   → Extension emits playerFinished { roomId, elapsedMs }
-   → Server stores in roomFinishTimes[roomId][socketId] = elapsedMs
+   → Extension scrapes accuracy from results page (correct/incorrect/incomplete)
+   → Extension emits playerFinished { roomId, elapsedMs, accuracy, correct, incorrect, incomplete }
+   → Server stores PlayerFinishData in roomFinishTimes[roomId][socketId]
 
-2. If first player to finish:
-   → Server emits "playerFinished" { roomId } to opponent (no time)
+2. If first player to finish with 100% accuracy (guaranteed winner):
+   → Server calls processEloGuaranteed() → computes & updates DB for both
+   → Server stores pre-computed ELO in roomEloResults
+   → Server emits "resultsReady" to winner immediately (opponentElapsedMs: -2 = still playing)
+   → Server emits "playerFinished" { roomId } to opponent (no details)
+   → Winner sees results with opponent card showing "Still playing..."
+
+3. If first player to finish with <100% accuracy:
+   → Server emits "playerFinished" { roomId } to opponent (no details)
    → Opponent's extension shows "Waiting for opponent..."
 
-3. If second player to finish (finishMap.size >= ROOM_MAX_CAPACITY):
-   → Server emits personalized "resultsReady" to EACH socket:
-     Socket A: { myElapsedMs: A_time, opponentElapsedMs: B_time }
-     Socket B: { myElapsedMs: B_time, opponentElapsedMs: A_time }
+4. If second player to finish (finishMap.size >= ROOM_MAX_CAPACITY):
+   a. If roomEloResults exists (100% early finish case):
+      → Server emits "resultsReady" to second player (loser) with full data + pre-computed ELO
+      → Server emits "opponentResults" to first player (winner) with opponent's accuracy/time
+   b. Normal case (no pre-computed ELO):
+      → Server calls processEloUpdate() (accuracy-first winner determination)
+      → Server emits personalized "resultsReady" to EACH socket with times + accuracy + ELO
    → Both extensions show Final Results screen
 
-4. If opponent disconnects before finishing:
+5. If opponent disconnects before finishing:
    → Extension handles via "partnerLeft" event
    → If player already finished, shows results with opponentElapsedMs: -1 (DNF)
+   → If 100% early ELO was processed, ELO stands (already written to DB)
 ```
 
 ### ELO Ranking System
@@ -766,9 +841,12 @@ Server-side ELO computation and persistence via Supabase.
 **Functions** (in `app.ts`):
 - `getRank(elo)` → rank name based on ELO value
 - `computeNewElo(currentElo, won)` → new ELO clamped to [472, 528]
-- `processEloUpdate(player1, player2)` → async: fetches ELO from Supabase, determines winner (lower elapsed time), computes new ELO, updates DB, returns results for both players
+- `processEloUpdate(player1, player2)` → async: fetches ELO from Supabase, determines winner (**accuracy-first**: higher accuracy wins; time tiebreaker; equal both = tie/no change), computes new ELO, updates DB, returns results for both players
+- `processEloGuaranteed(winnerSocketId, loserSocketId)` → async: called when first player finishes with 100% accuracy (guaranteed winner). Fetches ELO, computes new ELO for both, updates DB immediately, returns results. Winner sees results right away; loser sees theirs when they finish.
 
-**Flow**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (tie = no change, DNF = no result) → applies rank-specific delta → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
+**Flow (normal)**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (higher accuracy wins; time tiebreaker; tie = no change) → applies rank-specific delta → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
+
+**Flow (100% early finish)**: First player finishes with 100% accuracy → `processEloGuaranteed()` called → fetches both profiles → winner = first player (guaranteed) → computes and updates DB for both immediately → stores in `roomEloResults` → sends `resultsReady` to winner (`opponentElapsedMs: -2` = still playing) → when opponent finishes: sends `resultsReady` to loser + `opponentResults` to winner (fills in opponent's accuracy/time).
 
 ---
 
