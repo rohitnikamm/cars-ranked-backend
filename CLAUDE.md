@@ -25,11 +25,11 @@ This backend is part of a monorepo:
 
 ```
 cars-ranked-backend/
-├── app.ts                     # Main server file (HTTP + Socket.io) ~307 lines
+├── app.ts                     # Main server file (HTTP + Socket.io + ELO) ~400 lines
 ├── tsconfig.json              # TypeScript configuration
 ├── package.json               # Dependencies and scripts
 ├── package-lock.json          # Locked dependency versions
-├── .env                       # Environment variables (ADMIN_PASSWORD)
+├── .env                       # Environment variables (ADMIN_PASSWORD, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 ├── .gitignore                 # Git ignore patterns
 └── DEBUG_NOTES.md             # Development debugging notes
 ```
@@ -46,6 +46,7 @@ cars-ranked-backend/
 | **Real-time**      | Socket.io             | 4.8.3   |
 | **Admin UI**       | @socket.io/admin-ui   | 0.5.1   |
 | **Error Tracking** | Sentry (@sentry/node) | 10.32.1 |
+| **Database Client**| Supabase (@supabase/supabase-js) | 2.98.0 |
 | **Language**       | TypeScript            | 5.9.3   |
 | **Dev Server**     | Nodemon + tsx         | —       |
 | **Environment**    | dotenv                | 17.2.3  |
@@ -108,9 +109,19 @@ Tracks per-room player finish times for coordinating results.
 - When both players finish (`finishMap.size >= ROOM_MAX_CAPACITY`), personalized `resultsReady` events are emitted
 - Deleted on: `cancelMatchmake`, `disconnect` (when room empties), and safety net cleanup
 
+**`socketUser: Map<socketId, { userId: string, displayName: string }>`**
+
+Tracks authenticated user identity per socket for ELO updates.
+
+**Lifecycle**:
+- Set when client emits `matchmake` with `{ userId, displayName }`
+- Deleted on `cancelMatchmake` and `disconnect`
+
 **Other Maps**: `waitingRooms: Set<roomId>` (rooms with 1 player), `socketRoom: Map<socketId, roomId>` (for cleanup)
 
-**Important**: State is **not persisted** to disk. Server restart clears all rooms.
+**Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` to read/write `profiles.elo` column.
+
+**Important**: In-memory state is **not persisted** to disk. Server restart clears all rooms. ELO is persisted in Supabase `profiles` table.
 
 ---
 
@@ -342,14 +353,15 @@ Debug messages from server to client console.
 
 Auto-matchmaking: finds an open waiting room or creates a new one.
 
-**Payload**: None
+**Payload**: `{ userId?: string, displayName?: string }` — user identity for ELO tracking (stored in `socketUser` map)
 
 **Server Logic**:
 
 ```typescript
-1. Check if socket already in a room (prevent double-matchmake)
-2. Search waitingRooms for room with 1 player and < ROOM_MAX_CAPACITY
-3. If found:
+1. Store userId/displayName in socketUser map (if provided)
+2. Check if socket already in a room (prevent double-matchmake)
+3. Search waitingRooms for room with 1 player and < ROOM_MAX_CAPACITY
+4. If found:
    - socket.join(room), compute countdownEndAt = Date.now() + COUNTDOWN_MS
    - emit "matched" { roomId, role: "guest", countdownEndAt } to joining player
    - emit "matched" { roomId, role: "host", countdownEndAt } to waiting player
@@ -368,7 +380,7 @@ Cancel matchmaking or exit a room.
 
 **Payload**: None
 
-**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/roomPassages/roomFinishTimes, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
+**Server Logic**: Removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
 
 ---
 
@@ -420,8 +432,9 @@ Player finished the test. Server stores the elapsed time and coordinates results
 3. Prevent duplicate submissions (finishMap.has(socket.id))
 4. Store { socketId: elapsedMs } in roomFinishTimes
 5. If finishMap.size >= ROOM_MAX_CAPACITY (both players done):
-   - Emit "resultsReady" to EACH socket with personalized times:
-     { roomId, myElapsedMs: <their time>, opponentElapsedMs: <other's time> }
+   - Call processEloUpdate(): fetch ELO from Supabase, determine winner,
+     compute new ELO (rank-specific deltas), update DB
+   - Emit "resultsReady" to EACH socket with personalized times + ELO data
 6. If finishMap.size < ROOM_MAX_CAPACITY (first player):
    - Emit "playerFinished" { roomId } to opponent (no time revealed)
 ```
@@ -438,9 +451,27 @@ Emitted to the opponent when the first player finishes the test. Does not reveal
 
 #### Server → Client: `resultsReady`
 
-Emitted individually to each socket when both players have finished. Each player receives personalized results.
+Emitted individually to each socket when both players have finished. Each player receives personalized results with ELO data.
 
-**Payload**: `{ roomId: string, myElapsedMs: number, opponentElapsedMs: number }`
+**Payload**:
+```typescript
+{
+  roomId: string,
+  myElapsedMs: number,
+  opponentElapsedMs: number,
+  // ELO data (null if ELO processing failed)
+  myDisplayName: string,
+  myOldElo: number | null,
+  myNewElo: number | null,
+  myRank: string | null,       // "Caribbean" | "Osteopathic" | "Medical" | "Ivy"
+  myNewRank: string | null,
+  opponentDisplayName: string,
+  opponentOldElo: number | null,
+  opponentNewElo: number | null,
+  opponentRank: string | null,
+  opponentNewRank: string | null,
+}
+```
 
 ---
 
@@ -452,7 +483,7 @@ Triggered when a client disconnects (browser close, network loss, etc.).
 
 ```typescript
 1. Log: "User disconnected: {socket.id}"
-2. Look up room via socketRoom, clean up socketRoom entry
+2. Look up room via socketRoom, clean up socketRoom and socketUser entries
 3. If room found:
    a. Remove from waitingRooms
    b. If room empty: delete roomPassages and roomFinishTimes for that room
@@ -577,6 +608,8 @@ npm run build                # Compiles + uploads sourcemaps automatically
 
 ```bash
 ADMIN_PASSWORD="<bcrypt-hashed-password>"  # For Socket.io Admin UI
+SUPABASE_URL="https://nmhxwlqugqvzptbxtmqd.supabase.co"  # Supabase project URL
+SUPABASE_SERVICE_ROLE_KEY="<service-role-key>"  # Bypasses RLS for ELO updates
 ```
 
 **Generating Admin Password**:
@@ -714,6 +747,28 @@ if (numClients > 1) {
    → Extension handles via "partnerLeft" event
    → If player already finished, shows results with opponentElapsedMs: -1 (DNF)
 ```
+
+### ELO Ranking System
+
+Server-side ELO computation and persistence via Supabase.
+
+**Database**: `public.profiles.elo` — integer column, default 472, CHECK constraint [472, 528]
+
+**Ranks and Deltas**:
+
+| Rank | ELO Range | Win | Loss |
+|------|-----------|-----|------|
+| Caribbean | 472-485 | +5 | -1 |
+| Osteopathic | 486-499 | +3 | -2 |
+| Medical | 500-514 | +2 | -3 |
+| Ivy | 515-528 | +1 | -5 |
+
+**Functions** (in `app.ts`):
+- `getRank(elo)` → rank name based on ELO value
+- `computeNewElo(currentElo, won)` → new ELO clamped to [472, 528]
+- `processEloUpdate(player1, player2)` → async: fetches ELO from Supabase, determines winner (lower elapsed time), computes new ELO, updates DB, returns results for both players
+
+**Flow**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (tie = no change, DNF = no result) → applies rank-specific delta → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
 
 ---
 
@@ -971,8 +1026,9 @@ npm start
 
 ### Current Security Posture
 
-- **No authentication**: Anyone can create/join rooms with code
-- **Ephemeral data**: Passage info deleted when room empties
+- **No socket authentication**: Anyone can create/join rooms with code (user identity sent voluntarily with matchmake)
+- **Supabase service role key**: Used server-side only for ELO updates (bypasses RLS); never exposed to client
+- **Ephemeral data**: Passage info deleted when room empties; ELO persisted in Supabase
 - **No rate limiting**: Vulnerable to abuse (room creation spam)
 - **Permissive CORS**: Allows all origins
 

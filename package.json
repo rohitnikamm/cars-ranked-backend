@@ -17,6 +17,7 @@
     "@sentry/cli": "^3.0.1",
     "@sentry/node": "^10.32.1",
     "@socket.io/admin-ui": "^0.5.1",
+    "@supabase/supabase-js": "^2.98.0",
     "dotenv": "^17.2.3",
     "socket.io": "^4.8.3",
     "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.56.0"

@@ -1,9 +1,16 @@
 import crypto from "crypto";
 import { instrument } from "@socket.io/admin-ui";
+import { createClient } from "@supabase/supabase-js";
 import { Server } from "socket.io";
 import { App } from "uWebSockets.js";
 
 import "dotenv/config";
+
+// Supabase admin client (service role — bypasses RLS)
+const supabaseAdmin = createClient(
+	process.env.SUPABASE_URL as string,
+	process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+);
 
 const app = App();
 const io = new Server({
@@ -37,6 +44,85 @@ const socketRoom = new Map<string, string>();
 
 // Track player finish times per room: roomId -> Map<socketId, elapsedMs>
 const roomFinishTimes = new Map<string, Map<string, number>>();
+
+// Track socket -> authenticated user identity
+const socketUser = new Map<string, { userId: string; displayName: string }>();
+
+// ELO system
+type Rank = "Caribbean" | "Osteopathic" | "Medical" | "Ivy";
+
+function getRank(elo: number): Rank {
+	if (elo <= 485) return "Caribbean";
+	if (elo <= 499) return "Osteopathic";
+	if (elo <= 514) return "Medical";
+	return "Ivy";
+}
+
+const ELO_DELTAS: Record<Rank, { win: number; loss: number }> = {
+	Caribbean: { win: 5, loss: -1 },
+	Osteopathic: { win: 3, loss: -2 },
+	Medical: { win: 2, loss: -3 },
+	Ivy: { win: 1, loss: -5 },
+};
+
+function computeNewElo(currentElo: number, won: boolean): number {
+	const rank = getRank(currentElo);
+	const delta = won ? ELO_DELTAS[rank].win : ELO_DELTAS[rank].loss;
+	return Math.max(472, Math.min(528, currentElo + delta));
+}
+
+async function processEloUpdate(
+	player1: { socketId: string; elapsedMs: number },
+	player2: { socketId: string; elapsedMs: number },
+) {
+	const user1 = socketUser.get(player1.socketId);
+	const user2 = socketUser.get(player2.socketId);
+	if (!user1 || !user2) return null;
+
+	const { data: profiles, error } = await supabaseAdmin
+		.from("profiles")
+		.select("id, elo, display_name")
+		.in("id", [user1.userId, user2.userId]);
+
+	if (error || !profiles || profiles.length < 2) return null;
+
+	const profile1 = profiles.find((p) => p.id === user1.userId)!;
+	const profile2 = profiles.find((p) => p.id === user2.userId)!;
+
+	// Determine winner (lower elapsed time wins; both must be positive)
+	const p1Won =
+		player1.elapsedMs > 0 &&
+		(player2.elapsedMs < 0 || player1.elapsedMs < player2.elapsedMs);
+	const p2Won =
+		player2.elapsedMs > 0 &&
+		(player1.elapsedMs < 0 || player2.elapsedMs < player1.elapsedMs);
+	const isTie = !p1Won && !p2Won && player1.elapsedMs > 0 && player2.elapsedMs > 0;
+
+	const newElo1 = isTie ? profile1.elo : computeNewElo(profile1.elo, p1Won);
+	const newElo2 = isTie ? profile2.elo : computeNewElo(profile2.elo, p2Won);
+
+	await Promise.all([
+		supabaseAdmin.from("profiles").update({ elo: newElo1 }).eq("id", user1.userId),
+		supabaseAdmin.from("profiles").update({ elo: newElo2 }).eq("id", user2.userId),
+	]);
+
+	return {
+		[player1.socketId]: {
+			displayName: profile1.display_name,
+			oldElo: profile1.elo,
+			newElo: newElo1,
+			rank: getRank(profile1.elo),
+			newRank: getRank(newElo1),
+		},
+		[player2.socketId]: {
+			displayName: profile2.display_name,
+			oldElo: profile2.elo,
+			newElo: newElo2,
+			rank: getRank(profile2.elo),
+			newRank: getRank(newElo2),
+		},
+	};
+}
 
 // Check if room has 0 users (true if 0)
 function isEmpty(room: string) {
@@ -174,7 +260,10 @@ io.sockets.on("connection", (socket) => {
 	});
 
 	// Matchmaking: find an open room or create a new one
-	socket.on("matchmake", () => {
+	socket.on("matchmake", ({ userId, displayName }: { userId?: string; displayName?: string } = {}) => {
+		if (userId && displayName) {
+			socketUser.set(socket.id, { userId, displayName });
+		}
 		// Prevent double-matchmaking
 		if (socketRoom.has(socket.id)) {
 			socket.emit("error", { message: "Already in matchmaking" });
@@ -239,6 +328,7 @@ io.sockets.on("connection", (socket) => {
 
 		socket.leave(roomId);
 		socketRoom.delete(socket.id);
+		socketUser.delete(socket.id);
 		waitingRooms.delete(roomId);
 		roomPassages.delete(roomId);
 		roomFinishTimes.delete(roomId);
@@ -256,7 +346,7 @@ io.sockets.on("connection", (socket) => {
 	});
 
 	// Player finished the test
-	socket.on("playerFinished", ({ roomId, elapsedMs }: { roomId: string; elapsedMs: number }) => {
+	socket.on("playerFinished", async ({ roomId, elapsedMs }: { roomId: string; elapsedMs: number }) => {
 		const actualRoom = socketRoom.get(socket.id);
 		if (!actualRoom || actualRoom !== roomId) return;
 		if (typeof elapsedMs !== "number" || elapsedMs <= 0) return;
@@ -273,17 +363,37 @@ io.sockets.on("connection", (socket) => {
 		console.log(`[CARS Ranked] Player ${socket.id} finished in room ${roomId}: ${elapsedMs}ms`);
 
 		if (finishMap.size >= ROOM_MAX_CAPACITY) {
-			// Both players finished — send personalized results to each
+			// Both players finished — process ELO and send results
 			const entries = Array.from(finishMap.entries());
+
+			const eloResults = await processEloUpdate(
+				{ socketId: entries[0][0], elapsedMs: entries[0][1] },
+				{ socketId: entries[1][0], elapsedMs: entries[1][1] },
+			);
+
 			for (const [sid, time] of entries) {
+				const opponentSid = entries.find(([s]) => s !== sid)![0];
 				const opponentTime = entries.find(([s]) => s !== sid)?.[1] ?? 0;
+				const myElo = eloResults?.[sid];
+				const opElo = eloResults?.[opponentSid];
+
 				io.sockets.sockets.get(sid)?.emit("resultsReady", {
 					roomId,
 					myElapsedMs: time,
 					opponentElapsedMs: opponentTime,
+					myDisplayName: myElo?.displayName ?? socketUser.get(sid)?.displayName ?? "Unknown",
+					myOldElo: myElo?.oldElo ?? null,
+					myNewElo: myElo?.newElo ?? null,
+					myRank: myElo?.rank ?? null,
+					myNewRank: myElo?.newRank ?? null,
+					opponentDisplayName: opElo?.displayName ?? socketUser.get(opponentSid)?.displayName ?? "Unknown",
+					opponentOldElo: opElo?.oldElo ?? null,
+					opponentNewElo: opElo?.newElo ?? null,
+					opponentRank: opElo?.rank ?? null,
+					opponentNewRank: opElo?.newRank ?? null,
 				});
 			}
-			console.log(`[CARS Ranked] Results sent for room ${roomId}`);
+			console.log(`[CARS Ranked] Results + ELO sent for room ${roomId}`);
 		} else {
 			// First player finished — notify opponent (no time revealed)
 			socket.to(roomId).emit("playerFinished", { roomId });
@@ -296,6 +406,7 @@ io.sockets.on("connection", (socket) => {
 		console.log(`User disconnected: ${socket.id}`);
 		const roomId = socketRoom.get(socket.id);
 		socketRoom.delete(socket.id);
+		socketUser.delete(socket.id);
 
 		if (roomId) {
 			waitingRooms.delete(roomId);
