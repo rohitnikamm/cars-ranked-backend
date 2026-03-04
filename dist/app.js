@@ -32,12 +32,13 @@ io.attachApp(app);
 // Room configuration
 const ROOM_MAX_CAPACITY = 2;
 const COUNTDOWN_MS = 5000;
+const MATCHMAKE_TIMEOUT_MS = 30000;
+const ELO_RANGE = 15;
 // Generate random 5-char room code
 const random = () => crypto_1.default.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
 // Store passage information per room
 const roomPassages = new Map();
-// Rooms waiting for more players
-const waitingRooms = new Set();
+const waitingRooms = new Map();
 // Track which socket is in which room (socketId -> roomId)
 const socketRoom = new Map();
 // Track player finish data per room: roomId -> Map<socketId, PlayerFinishData>
@@ -60,10 +61,24 @@ const ELO_DELTAS = {
     Medical: { win: 2, loss: -3 },
     Ivy: { win: 1, loss: -5 },
 };
+const RANK_FLOORS = {
+    Caribbean: 472,
+    Osteopathic: 486,
+    Medical: 500,
+    Ivy: 515,
+};
 function computeNewElo(currentElo, won) {
     const rank = getRank(currentElo);
     const delta = won ? ELO_DELTAS[rank].win : ELO_DELTAS[rank].loss;
-    return Math.max(472, Math.min(528, currentElo + delta));
+    let newElo = currentElo + delta;
+    // ELO loss cap: if losing would cross a rank boundary, cap at top of the lower rank
+    if (!won && rank !== "Caribbean") {
+        const floor = RANK_FLOORS[rank];
+        if (newElo < floor) {
+            newElo = floor - 1;
+        }
+    }
+    return Math.max(472, Math.min(528, newElo));
 }
 function processEloUpdate(player1, player2) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -265,8 +280,9 @@ setInterval(() => {
             cleaned++;
         }
     }
-    for (const roomId of waitingRooms) {
+    for (const [roomId, entry] of waitingRooms) {
         if (isEmpty(roomId)) {
+            clearTimeout(entry.timeoutHandle);
             waitingRooms.delete(roomId);
             cleaned++;
         }
@@ -282,7 +298,7 @@ io.sockets.on("connection", (socket) => {
         socket.emit("clockSyncResponse", { t0, t1: Date.now() });
     });
     // Matchmaking: find an open room or create a new one
-    socket.on("matchmake", ({ userId, displayName } = {}) => {
+    socket.on("matchmake", (...args_1) => __awaiter(void 0, [...args_1], void 0, function* ({ userId, displayName, matchType = "ranked" } = {}) {
         if (userId && displayName) {
             socketUser.set(socket.id, { userId, displayName });
         }
@@ -291,26 +307,54 @@ io.sockets.on("connection", (socket) => {
             socket.emit("error", { message: "Already in matchmaking" });
             return;
         }
-        // Find first available waiting room
+        // Fetch authoritative ELO from Supabase (tamper-proof)
+        let playerElo = 472; // default
+        if (userId) {
+            try {
+                const { data } = yield supabaseAdmin
+                    .from("profiles")
+                    .select("elo")
+                    .eq("id", userId)
+                    .single();
+                if ((data === null || data === void 0 ? void 0 : data.elo) != null) {
+                    playerElo = data.elo;
+                }
+            }
+            catch (err) {
+                console.warn(`[CARS Ranked] Failed to fetch ELO for ${userId}, using default:`, err);
+            }
+        }
+        // Find compatible waiting room
         let assignedRoom = null;
-        for (const roomId of waitingRooms) {
+        for (const [roomId, entry] of waitingRooms) {
+            if (entry.matchType !== matchType)
+                continue;
             const roomSize = getRoomSize(roomId);
-            if (roomSize > 0 && roomSize < ROOM_MAX_CAPACITY) {
+            if (roomSize === 0) {
+                // Stale entry — clean up
+                clearTimeout(entry.timeoutHandle);
+                waitingRooms.delete(roomId);
+                roomPassages.delete(roomId);
+                continue;
+            }
+            if (roomSize < ROOM_MAX_CAPACITY) {
+                // For ranked: bidirectional ±ELO_RANGE check
+                if (matchType === "ranked" && Math.abs(playerElo - entry.elo) > ELO_RANGE) {
+                    continue;
+                }
                 assignedRoom = roomId;
                 break;
             }
-            else if (roomSize === 0) {
-                // Stale entry — clean up
-                waitingRooms.delete(roomId);
-                roomPassages.delete(roomId);
-            }
         }
         if (assignedRoom) {
+            // Cancel the waiting player's timeout
+            const waitingEntry = waitingRooms.get(assignedRoom);
+            clearTimeout(waitingEntry.timeoutHandle);
             // Join existing room
             socket.join(assignedRoom);
             socketRoom.set(socket.id, assignedRoom);
             waitingRooms.delete(assignedRoom); // Room is now full
-            console.log(`[CARS Ranked] Matchmake: ${socket.id} joined existing room ${assignedRoom}`);
+            console.log(`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) joined existing room ${assignedRoom} (host ELO ${waitingEntry.elo})`);
             // Notify both players with same absolute countdown target
             const countdownEndAt = Date.now() + COUNTDOWN_MS;
             socket.emit("matched", { roomId: assignedRoom, role: "guest", countdownEndAt });
@@ -326,17 +370,31 @@ io.sockets.on("connection", (socket) => {
             }
             socket.join(code);
             socketRoom.set(socket.id, code);
-            waitingRooms.add(code);
-            console.log(`[CARS Ranked] Matchmake: ${socket.id} created new room ${code}, waiting for opponent`);
+            // Start timeout — if no match found within MATCHMAKE_TIMEOUT_MS, notify client
+            const timeoutHandle = setTimeout(() => {
+                socket.emit("matchmakeTimeout", { roomId: code });
+                socket.leave(code);
+                socketRoom.delete(socket.id);
+                socketUser.delete(socket.id);
+                waitingRooms.delete(code);
+                console.log(`[CARS Ranked] Matchmake timeout: ${socket.id} in room ${code} after ${MATCHMAKE_TIMEOUT_MS}ms`);
+            }, MATCHMAKE_TIMEOUT_MS);
+            waitingRooms.set(code, { socketId: socket.id, elo: playerElo, matchType, timeoutHandle });
+            console.log(`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) created new room ${code}, waiting for opponent`);
             socket.emit("waiting", { roomId: code });
         }
-    });
+    }));
     // Cancel matchmaking
     socket.on("cancelMatchmake", () => {
         const roomId = socketRoom.get(socket.id);
         if (!roomId)
             return;
         const roomSize = getRoomSize(roomId);
+        // Cancel timeout if this socket was waiting
+        const waitingEntry = waitingRooms.get(roomId);
+        if (waitingEntry) {
+            clearTimeout(waitingEntry.timeoutHandle);
+        }
         socket.leave(roomId);
         socketRoom.delete(socket.id);
         socketUser.delete(socket.id);
@@ -511,6 +569,11 @@ io.sockets.on("connection", (socket) => {
         socketRoom.delete(socket.id);
         socketUser.delete(socket.id);
         if (roomId) {
+            // Cancel timeout if this socket was waiting
+            const waitingEntry = waitingRooms.get(roomId);
+            if (waitingEntry) {
+                clearTimeout(waitingEntry.timeoutHandle);
+            }
             waitingRooms.delete(roomId);
             const roomSize = getRoomSize(roomId);
             if (roomSize === 0) {

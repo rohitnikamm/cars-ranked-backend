@@ -95,10 +95,27 @@ const ELO_DELTAS: Record<Rank, { win: number; loss: number }> = {
 	Ivy: { win: 1, loss: -5 },
 };
 
+const RANK_FLOORS: Record<Rank, number> = {
+	Caribbean: 472,
+	Osteopathic: 486,
+	Medical: 500,
+	Ivy: 515,
+};
+
 function computeNewElo(currentElo: number, won: boolean): number {
 	const rank = getRank(currentElo);
 	const delta = won ? ELO_DELTAS[rank].win : ELO_DELTAS[rank].loss;
-	return Math.max(472, Math.min(528, currentElo + delta));
+	let newElo = currentElo + delta;
+
+	// ELO loss cap: if losing would cross a rank boundary, cap at top of the lower rank
+	if (!won && rank !== "Caribbean") {
+		const floor = RANK_FLOORS[rank];
+		if (newElo < floor) {
+			newElo = floor - 1;
+		}
+	}
+
+	return Math.max(472, Math.min(528, newElo));
 }
 
 async function processEloUpdate(

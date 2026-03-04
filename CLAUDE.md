@@ -869,11 +869,11 @@ Server-side ELO computation and persistence via Supabase.
 
 **Functions** (in `app.ts`):
 - `getRank(elo)` → rank name based on ELO value
-- `computeNewElo(currentElo, won)` → new ELO clamped to [472, 528]
+- `computeNewElo(currentElo, won)` → new ELO clamped to [472, 528]; applies **ELO loss cap** — if a loss would cross a rank boundary, caps at top of the lower rank (e.g., 516 Ivy → 514, not 511). No gain cap. Uses `RANK_FLOORS` lookup.
 - `processEloUpdate(player1, player2)` → async: fetches ELO from Supabase, determines winner (**accuracy-first**: higher accuracy wins; time tiebreaker; equal both = tie/no change), computes new ELO, updates DB, returns results for both players
 - `processEloGuaranteed(winnerSocketId, loserSocketId)` → async: called when first player finishes with 100% accuracy (guaranteed winner). Fetches ELO, computes new ELO for both, updates DB immediately, returns results. Winner sees results right away; loser sees theirs when they finish.
 
-**Flow (normal)**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (higher accuracy wins; time tiebreaker; tie = no change) → applies rank-specific delta → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
+**Flow (normal)**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (higher accuracy wins; time tiebreaker; tie = no change) → applies rank-specific delta (with loss cap at rank boundary) → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
 
 **Flow (100% early finish)**: First player finishes with 100% accuracy → `processEloGuaranteed()` called → fetches both profiles → winner = first player (guaranteed) → computes and updates DB for both immediately → stores in `roomEloResults` → sends `resultsReady` to winner (`opponentElapsedMs: -2` = still playing) → when opponent finishes: sends `resultsReady` to loser + `opponentResults` to winner (fills in opponent's accuracy/time).
 
