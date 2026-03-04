@@ -26,7 +26,8 @@ This backend is part of a monorepo:
 ```
 cars-ranked-backend/
 ├── app.ts                     # Main server file (HTTP + Socket.io + ELO + accuracy tracking) ~850 lines
-├── tsconfig.json              # TypeScript configuration
+├── Dockerfile                 # Ubuntu 24.04 + Node 22 for Railway deployment (uWebSockets.js requires glibc 2.38+)
+├── tsconfig.json              # TypeScript configuration (module: nodenext)
 ├── package.json               # Dependencies and scripts
 ├── package-lock.json          # Locked dependency versions
 ├── .env                       # Environment variables (ADMIN_PASSWORD, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -177,7 +178,7 @@ Tracks match type per room for ELO decision at finish time.
 - Included in all `resultsReady` emissions as `matchType` field
 - Deleted on: `cancelMatchmake`, `disconnect` (when room empties), periodic 60s sweeper, and safety net cleanup
 
-**Other Maps**: `socketRoom: Map<socketId, roomId>` (for cleanup)
+**Other Maps**: `socketRoom: Map<socketId, roomId>` (for cleanup), `matchmakingInProgress: Set<socketId>` (async mutex — prevents concurrent processing of duplicate matchmake events from the same socket; entries added before async work and removed in `finally` block)
 
 **Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column.
 
@@ -312,19 +313,21 @@ Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30
 
 ```typescript
 1. Store userId/displayName in socketUser map (if provided)
-2. Check if socket already in a room (prevent double-matchmake)
-3. Fetch player's authoritative ELO from Supabase (tamper-proof): profiles.elo (default 472)
-4. Search waitingRooms for compatible room:
+2. Acquire async mutex (matchmakingInProgress Set) — prevents concurrent processing of duplicate matchmake events from the same socket
+3. Check if socket already in a room (prevent double-matchmake)
+4. Fetch player's authoritative ELO from Supabase (tamper-proof): profiles.elo (default 472)
+5. Search waitingRooms for compatible room:
    - Must match matchType
+   - Never match a socket with itself (entry.socketId !== socket.id)
    - For ranked: bidirectional ±ELO_RANGE check (Math.abs(playerElo - entry.elo) <= 15)
-   - For casual (future): no ELO filter
+   - For casual: no ELO filter
    - Clean up stale entries (roomSize === 0) during iteration
-5. If compatible room found:
+6. If compatible room found:
    - clearTimeout(waitingEntry.timeoutHandle) — cancel waiting player's 30s timer
    - socket.join(room), compute countdownEndAt = Date.now() + COUNTDOWN_MS
    - emit "matched" { roomId, role: "guest", countdownEndAt } to joining player
    - emit "matched" { roomId, role: "host", countdownEndAt } to waiting player
-6. If no compatible room:
+7. If no compatible room:
    - Create new room, socket.join(room)
    - roomMatchTypes.set(code, matchType) — track match type for ELO gating
    - Start 30s timeout → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
@@ -510,7 +513,7 @@ Socket.io Admin UI is enabled via `@socket.io/admin-ui`.
 
 **Access**:
 
-- URL: http://localhost:3000/admin
+- URL: http://localhost:3000/admin (dev) or https://cars-ranked-backend-qa.up.railway.app/admin (QA)
 - Username: `admin`
 - Password: Bcrypt hash stored in `ADMIN_PASSWORD` environment variable
 
@@ -560,12 +563,9 @@ For full extension details, see [`../cars-ranked/CLAUDE.md`](../cars-ranked/CLAU
 ```bash
 # Development
 npm run dev                  # Nodemon + tsx → watches app.ts → port 3000
-npm run build                # TypeScript compile → dist/
+npm run build                # TypeScript compile → dist/ (tsc only)
+npm run build:full           # TypeScript compile + Sentry sourcemap upload
 npm start                    # Run compiled dist/app.js
-npm run sentry:sourcemaps    # Upload source maps to Sentry (requires SENTRY_AUTH_TOKEN)
-
-# Sentry (included in build)
-npm run build                # Compiles + uploads sourcemaps automatically
 ```
 
 **Note**: No test framework is configured.
@@ -609,9 +609,9 @@ ADMIN_PASSWORD="$2a$10$..."
 
 **Default**: Port **3000** via `const PORT = Number(process.env.PORT) || 3000`.
 
-**To Change**: Set `PORT` environment variable in `.env`.
+**Railway**: `PORT` is auto-injected by Railway at runtime — do not set it manually in Railway env vars.
 
-**Extension Update Required**:
+**Local Dev**: Set `PORT` in `.env` to override the default. Update `cars-ranked/.env` accordingly:
 
 ```bash
 # cars-ranked/.env
@@ -927,33 +927,39 @@ When extension modifies backend requirements:
 
 ---
 
-## Production Deployment
+## Production Deployment (Railway)
 
-### Build for Production
+The backend is deployed to **Railway** using a Dockerfile.
+
+### Why Dockerfile?
+
+Railway's default Node.js buildpack uses a Linux image with glibc < 2.38. uWebSockets.js v20.56.0 requires glibc 2.38+. The `Dockerfile` uses Ubuntu 24.04 (glibc 2.39) to satisfy this requirement.
+
+### Deployment
+
+Railway auto-detects the Dockerfile and builds from it. Pushes to the connected GitHub branch trigger automatic deploys.
+
+- **QA URL**: `https://cars-ranked-backend-qa.up.railway.app`
+- **Admin UI**: `https://cars-ranked-backend-qa.up.railway.app/admin`
+
+### Railway Environment Variables
+
+Set these in the Railway dashboard (Variables tab):
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `SUPABASE_URL` | `https://nmhxwlqugqvzptbxtmqd.supabase.co` | Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | `<service-role-key>` | Bypasses RLS for ELO updates |
+| `ADMIN_PASSWORD` | `<bcrypt-hash>` | For Socket.io Admin UI |
+| `PORT` | *(do not set)* | Auto-injected by Railway |
+
+### Local Build & Run
 
 ```bash
-npm run build
-# Outputs to dist/app.js
-# Automatically uploads sourcemaps to Sentry
+npm run build        # TypeScript compile → dist/
+npm start            # Runs node dist/app.js
+npm run build:full   # Compile + upload Sentry sourcemaps
 ```
-
-### Run Production Build
-
-```bash
-npm start
-# Runs node dist/app.js
-```
-
-### Environment Checklist
-
-- [ ] Set `ADMIN_PASSWORD` in production `.env`
-- [ ] Configure Sentry environment variables (optional)
-- [ ] Update extension `.env` with production backend URL
-- [ ] Restrict CORS `origin` to extension domain
-- [ ] Consider persisting `roomPassages` to Redis/database
-- [ ] Set up process manager (PM2, systemd, etc.)
-- [ ] Configure reverse proxy (nginx) for HTTPS
-- [ ] Enable rate limiting for HTTP endpoints
 
 ### Scaling Considerations
 

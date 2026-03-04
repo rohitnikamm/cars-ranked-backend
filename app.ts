@@ -81,6 +81,9 @@ const roomMatchTypes = new Map<string, MatchType>();
 // Track socket -> authenticated user identity
 const socketUser = new Map<string, { userId: string; displayName: string }>();
 
+// Mutex: prevent concurrent matchmake processing for the same socket (async race guard)
+const matchmakingInProgress = new Set<string>();
+
 // ELO system
 type Rank = "Caribbean" | "Osteopathic" | "Medical" | "Ivy";
 
@@ -385,101 +388,112 @@ io.sockets.on("connection", (socket) => {
 		if (userId && displayName) {
 			socketUser.set(socket.id, { userId, displayName });
 		}
-		// Prevent double-matchmaking
-		if (socketRoom.has(socket.id)) {
-			socket.emit("error", { message: "Already in matchmaking" });
+		// Prevent concurrent matchmake processing (async race guard)
+		if (matchmakingInProgress.has(socket.id)) {
 			return;
 		}
+		matchmakingInProgress.add(socket.id);
+		try {
+			// Prevent double-matchmaking
+			if (socketRoom.has(socket.id)) {
+				socket.emit("error", { message: "Already in matchmaking" });
+				return;
+			}
 
-		// Fetch authoritative ELO from Supabase (tamper-proof)
-		let playerElo = 472; // default
-		if (userId) {
-			try {
-				const { data } = await supabaseAdmin
-					.from("profiles")
-					.select("elo")
-					.eq("id", userId)
-					.single();
-				if (data?.elo != null) {
-					playerElo = data.elo;
+			// Fetch authoritative ELO from Supabase (tamper-proof)
+			let playerElo = 472; // default
+			if (userId) {
+				try {
+					const { data } = await supabaseAdmin
+						.from("profiles")
+						.select("elo")
+						.eq("id", userId)
+						.single();
+					if (data?.elo != null) {
+						playerElo = data.elo;
+					}
+				} catch (err) {
+					console.warn(`[CARS Ranked] Failed to fetch ELO for ${userId}, using default:`, err);
 				}
-			} catch (err) {
-				console.warn(`[CARS Ranked] Failed to fetch ELO for ${userId}, using default:`, err);
 			}
-		}
 
-		// Find compatible waiting room
-		let assignedRoom: string | null = null;
-		for (const [roomId, entry] of waitingRooms) {
-			if (entry.matchType !== matchType) continue;
-			const roomSize = getRoomSize(roomId);
-			if (roomSize === 0) {
-				// Stale entry — clean up
-				clearTimeout(entry.timeoutHandle);
-				waitingRooms.delete(roomId);
-				roomPassages.delete(roomId);
-				continue;
-			}
-			if (roomSize < ROOM_MAX_CAPACITY) {
-				// For ranked: bidirectional ±ELO_RANGE check
-				if (matchType === "ranked" && Math.abs(playerElo - entry.elo) > ELO_RANGE) {
+			// Find compatible waiting room
+			let assignedRoom: string | null = null;
+			for (const [roomId, entry] of waitingRooms) {
+				if (entry.matchType !== matchType) continue;
+				// Never match a socket with itself
+				if (entry.socketId === socket.id) continue;
+				const roomSize = getRoomSize(roomId);
+				if (roomSize === 0) {
+					// Stale entry — clean up
+					clearTimeout(entry.timeoutHandle);
+					waitingRooms.delete(roomId);
+					roomPassages.delete(roomId);
 					continue;
 				}
-				assignedRoom = roomId;
-				break;
-			}
-		}
-
-		if (assignedRoom) {
-			// Cancel the waiting player's timeout
-			const waitingEntry = waitingRooms.get(assignedRoom)!;
-			clearTimeout(waitingEntry.timeoutHandle);
-
-			// Join existing room
-			socket.join(assignedRoom);
-			socketRoom.set(socket.id, assignedRoom);
-			waitingRooms.delete(assignedRoom); // Room is now full
-
-			console.log(
-				`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) joined existing room ${assignedRoom} (host ELO ${waitingEntry.elo})`,
-			);
-
-			// Notify both players with same absolute countdown target
-			const countdownEndAt = Date.now() + COUNTDOWN_MS;
-			socket.emit("matched", { roomId: assignedRoom, role: "guest", countdownEndAt });
-			socket
-				.to(assignedRoom)
-				.emit("matched", { roomId: assignedRoom, role: "host", countdownEndAt });
-		} else {
-			// Create new room
-			let code = random();
-			while (!isEmpty(code)) {
-				code = random();
+				if (roomSize < ROOM_MAX_CAPACITY) {
+					// For ranked: bidirectional ±ELO_RANGE check
+					if (matchType === "ranked" && Math.abs(playerElo - entry.elo) > ELO_RANGE) {
+						continue;
+					}
+					assignedRoom = roomId;
+					break;
+				}
 			}
 
-			socket.join(code);
-			socketRoom.set(socket.id, code);
-			roomMatchTypes.set(code, matchType);
+			if (assignedRoom) {
+				// Cancel the waiting player's timeout
+				const waitingEntry = waitingRooms.get(assignedRoom)!;
+				clearTimeout(waitingEntry.timeoutHandle);
 
-			// Start timeout — if no match found within MATCHMAKE_TIMEOUT_MS, notify client
-			const timeoutHandle = setTimeout(() => {
-				socket.emit("matchmakeTimeout", { roomId: code });
-				socket.leave(code);
-				socketRoom.delete(socket.id);
-				socketUser.delete(socket.id);
-				waitingRooms.delete(code);
+				// Join existing room
+				socket.join(assignedRoom);
+				socketRoom.set(socket.id, assignedRoom);
+				waitingRooms.delete(assignedRoom); // Room is now full
+
 				console.log(
-					`[CARS Ranked] Matchmake timeout: ${socket.id} in room ${code} after ${MATCHMAKE_TIMEOUT_MS}ms`,
+					`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) joined existing room ${assignedRoom} (host ELO ${waitingEntry.elo})`,
 				);
-			}, MATCHMAKE_TIMEOUT_MS);
 
-			waitingRooms.set(code, { socketId: socket.id, elo: playerElo, matchType, timeoutHandle });
+				// Notify both players with same absolute countdown target
+				const countdownEndAt = Date.now() + COUNTDOWN_MS;
+				socket.emit("matched", { roomId: assignedRoom, role: "guest", countdownEndAt });
+				socket
+					.to(assignedRoom)
+					.emit("matched", { roomId: assignedRoom, role: "host", countdownEndAt });
+			} else {
+				// Create new room
+				let code = random();
+				while (!isEmpty(code)) {
+					code = random();
+				}
 
-			console.log(
-				`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) created new room ${code}, waiting for opponent`,
-			);
+				socket.join(code);
+				socketRoom.set(socket.id, code);
+				roomMatchTypes.set(code, matchType);
 
-			socket.emit("waiting", { roomId: code });
+				// Start timeout — if no match found within MATCHMAKE_TIMEOUT_MS, notify client
+				const timeoutHandle = setTimeout(() => {
+					socket.emit("matchmakeTimeout", { roomId: code });
+					socket.leave(code);
+					socketRoom.delete(socket.id);
+					socketUser.delete(socket.id);
+					waitingRooms.delete(code);
+					console.log(
+						`[CARS Ranked] Matchmake timeout: ${socket.id} in room ${code} after ${MATCHMAKE_TIMEOUT_MS}ms`,
+					);
+				}, MATCHMAKE_TIMEOUT_MS);
+
+				waitingRooms.set(code, { socketId: socket.id, elo: playerElo, matchType, timeoutHandle });
+
+				console.log(
+					`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) created new room ${code}, waiting for opponent`,
+				);
+
+				socket.emit("waiting", { roomId: code });
+			}
+		} finally {
+			matchmakingInProgress.delete(socket.id);
 		}
 	});
 
