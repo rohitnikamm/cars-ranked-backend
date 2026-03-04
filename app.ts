@@ -75,6 +75,9 @@ type EloResult = {
 };
 const roomEloResults = new Map<string, Record<string, EloResult>>();
 
+// Track match type per room for ELO decision at finish time
+const roomMatchTypes = new Map<string, MatchType>();
+
 // Track socket -> authenticated user identity
 const socketUser = new Map<string, { userId: string; displayName: string }>();
 
@@ -347,6 +350,13 @@ setInterval(() => {
 			roomPassages.delete(roomId);
 			roomFinishTimes.delete(roomId);
 			roomEloResults.delete(roomId);
+			roomMatchTypes.delete(roomId);
+			cleaned++;
+		}
+	}
+	for (const [roomId] of roomMatchTypes) {
+		if (isEmpty(roomId)) {
+			roomMatchTypes.delete(roomId);
 			cleaned++;
 		}
 	}
@@ -449,6 +459,7 @@ io.sockets.on("connection", (socket) => {
 
 			socket.join(code);
 			socketRoom.set(socket.id, code);
+			roomMatchTypes.set(code, matchType);
 
 			// Start timeout — if no match found within MATCHMAKE_TIMEOUT_MS, notify client
 			const timeoutHandle = setTimeout(() => {
@@ -492,6 +503,7 @@ io.sockets.on("connection", (socket) => {
 		roomPassages.delete(roomId);
 		roomFinishTimes.delete(roomId);
 		roomEloResults.delete(roomId);
+		roomMatchTypes.delete(roomId);
 
 		// If someone else was in the room (rare race), notify them
 		if (roomSize > 1) {
@@ -543,6 +555,9 @@ io.sockets.on("connection", (socket) => {
 		finishMap.set(socket.id, playerData);
 		console.log(`[CARS Ranked] Player ${socket.id} finished in room ${roomId}: ${elapsedMs}ms, accuracy=${accuracy}%`);
 
+		const isCasual = roomMatchTypes.get(roomId) === "casual";
+		const roomMatchType = roomMatchTypes.get(roomId) ?? "ranked";
+
 		if (finishMap.size >= ROOM_MAX_CAPACITY) {
 			// Both players finished
 			const entries = Array.from(finishMap.entries());
@@ -563,6 +578,7 @@ io.sockets.on("connection", (socket) => {
 				// Send full results to second player (the loser)
 				io.sockets.sockets.get(secondSid)?.emit("resultsReady", {
 					roomId,
+					matchType: roomMatchType,
 					myElapsedMs: secondData.elapsedMs,
 					opponentElapsedMs: firstData.elapsedMs,
 					myAccuracy: secondData.accuracy,
@@ -594,8 +610,52 @@ io.sockets.on("connection", (socket) => {
 
 				roomEloResults.delete(roomId);
 				console.log(`[CARS Ranked] Results sent for room ${roomId} (early ELO path)`);
+			} else if (isCasual) {
+				// Casual mode: no ELO changes — fetch profiles read-only for display
+				const user1 = socketUser.get(entries[0][0]);
+				const user2 = socketUser.get(entries[1][0]);
+				let profiles: { id: string; elo: number; display_name: string }[] = [];
+				if (user1 && user2) {
+					const { data } = await supabaseAdmin
+						.from("profiles")
+						.select("id, elo, display_name")
+						.in("id", [user1.userId, user2.userId]);
+					profiles = data ?? [];
+				}
+
+				for (const [sid, data] of entries) {
+					const opponentSid = entries.find(([s]) => s !== sid)![0];
+					const opponentData = entries.find(([s]) => s !== sid)![1];
+					const myUser = socketUser.get(sid);
+					const opUser = socketUser.get(opponentSid);
+					const myProfile = profiles.find((p) => p.id === myUser?.userId);
+					const opProfile = profiles.find((p) => p.id === opUser?.userId);
+
+					io.sockets.sockets.get(sid)?.emit("resultsReady", {
+						roomId,
+						matchType: roomMatchType,
+						myElapsedMs: data.elapsedMs,
+						opponentElapsedMs: opponentData.elapsedMs,
+						myAccuracy: data.accuracy,
+						opponentAccuracy: opponentData.accuracy,
+						opponentCorrect: opponentData.correct,
+						opponentIncorrect: opponentData.incorrect,
+						opponentIncomplete: opponentData.incomplete,
+						myDisplayName: myProfile?.display_name ?? myUser?.displayName ?? "Unknown",
+						myOldElo: myProfile?.elo ?? null,
+						myNewElo: myProfile?.elo ?? null,
+						myRank: myProfile ? getRank(myProfile.elo) : null,
+						myNewRank: myProfile ? getRank(myProfile.elo) : null,
+						opponentDisplayName: opProfile?.display_name ?? opUser?.displayName ?? "Unknown",
+						opponentOldElo: opProfile?.elo ?? null,
+						opponentNewElo: opProfile?.elo ?? null,
+						opponentRank: opProfile ? getRank(opProfile.elo) : null,
+						opponentNewRank: opProfile ? getRank(opProfile.elo) : null,
+					});
+				}
+				console.log(`[CARS Ranked] Casual results sent for room ${roomId} (no ELO change)`);
 			} else {
-				// Normal case: both finished, process ELO now
+				// Ranked: both finished, process ELO now
 				const eloResults = await processEloUpdate(
 					{ socketId: entries[0][0], data: entries[0][1] },
 					{ socketId: entries[1][0], data: entries[1][1] },
@@ -609,6 +669,7 @@ io.sockets.on("connection", (socket) => {
 
 					io.sockets.sockets.get(sid)?.emit("resultsReady", {
 						roomId,
+						matchType: roomMatchType,
 						myElapsedMs: data.elapsedMs,
 						opponentElapsedMs: opponentData.elapsedMs,
 						myAccuracy: data.accuracy,
@@ -632,7 +693,7 @@ io.sockets.on("connection", (socket) => {
 			}
 		} else {
 			// First player finished — check for 100% guaranteed win
-			if (accuracy !== null && accuracy === 100) {
+			if (accuracy !== null && accuracy === 100 && !isCasual) {
 				// Find opponent socket ID from the room
 				const roomSockets = io.sockets.adapter.rooms.get(roomId);
 				let opponentSid: string | null = null;
@@ -658,6 +719,7 @@ io.sockets.on("connection", (socket) => {
 						// Send results to winner immediately (opponent data pending)
 						socket.emit("resultsReady", {
 							roomId,
+							matchType: roomMatchType,
 							myElapsedMs: elapsedMs,
 							opponentElapsedMs: -2, // -2 = opponent still playing
 							myAccuracy: accuracy,
@@ -678,6 +740,56 @@ io.sockets.on("connection", (socket) => {
 						});
 						console.log(`[CARS Ranked] 100% accuracy: immediate ELO for room ${roomId}`);
 					}
+				}
+			} else if (accuracy !== null && accuracy === 100 && isCasual) {
+				// Casual 100%: send results immediately but with no ELO changes
+				const roomSockets = io.sockets.adapter.rooms.get(roomId);
+				let opponentSid: string | null = null;
+				if (roomSockets) {
+					for (const sid of roomSockets) {
+						if (sid !== socket.id) {
+							opponentSid = sid;
+							break;
+						}
+					}
+				}
+
+				if (opponentSid) {
+					const myUser = socketUser.get(socket.id);
+					const opUser = socketUser.get(opponentSid);
+					let profiles: { id: string; elo: number; display_name: string }[] = [];
+					if (myUser && opUser) {
+						const { data } = await supabaseAdmin
+							.from("profiles")
+							.select("id, elo, display_name")
+							.in("id", [myUser.userId, opUser.userId]);
+						profiles = data ?? [];
+					}
+					const myProfile = profiles.find((p) => p.id === myUser?.userId);
+					const opProfile = profiles.find((p) => p.id === opUser?.userId);
+
+					socket.emit("resultsReady", {
+						roomId,
+						matchType: roomMatchType,
+						myElapsedMs: elapsedMs,
+						opponentElapsedMs: -2,
+						myAccuracy: accuracy,
+						opponentAccuracy: null,
+						opponentCorrect: null,
+						opponentIncorrect: null,
+						opponentIncomplete: null,
+						myDisplayName: myProfile?.display_name ?? myUser?.displayName ?? "Unknown",
+						myOldElo: myProfile?.elo ?? null,
+						myNewElo: myProfile?.elo ?? null,
+						myRank: myProfile ? getRank(myProfile.elo) : null,
+						myNewRank: myProfile ? getRank(myProfile.elo) : null,
+						opponentDisplayName: opProfile?.display_name ?? opUser?.displayName ?? "Unknown",
+						opponentOldElo: opProfile?.elo ?? null,
+						opponentNewElo: opProfile?.elo ?? null,
+						opponentRank: opProfile ? getRank(opProfile.elo) : null,
+						opponentNewRank: opProfile ? getRank(opProfile.elo) : null,
+					});
+					console.log(`[CARS Ranked] Casual 100% accuracy: immediate results for room ${roomId} (no ELO change)`);
 				}
 			}
 
@@ -707,6 +819,7 @@ io.sockets.on("connection", (socket) => {
 				roomPassages.delete(roomId);
 				roomFinishTimes.delete(roomId);
 				roomEloResults.delete(roomId);
+				roomMatchTypes.delete(roomId);
 				console.log(`[CARS Ranked] Cleaned up empty room ${roomId}`);
 			} else if (roomSize < ROOM_MAX_CAPACITY) {
 				// Partner left — notify remaining players
@@ -731,6 +844,11 @@ io.sockets.on("connection", (socket) => {
 		roomEloResults.forEach((_, rid) => {
 			if (isEmpty(rid)) {
 				roomEloResults.delete(rid);
+			}
+		});
+		roomMatchTypes.forEach((_, rid) => {
+			if (isEmpty(rid)) {
+				roomMatchTypes.delete(rid);
 			}
 		});
 	});

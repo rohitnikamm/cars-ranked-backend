@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 CARS Ranked Backend is a Node.js server that provides HTTP REST API and Socket.io WebSocket functionality for the CARS Ranked browser extension. It manages ELO-filtered matchmaking, room creation, passage synchronization, and real-time user coordination for MCAT CARS study sessions.
 
-**Purpose**: Coordinate ELO-filtered matchmaking (±15 ELO for ranked, first-come-first-served for casual) and synchronized passage selection between multiple browser extension clients. Server fetches ELO from Supabase (tamper-proof) and enforces a 30-second matchmaking timeout.
+**Purpose**: Coordinate matchmaking (±15 ELO-filtered for ranked, first-come-first-served for casual) and synchronized passage selection between multiple browser extension clients. Server fetches ELO from Supabase (tamper-proof) and enforces a 30-second matchmaking timeout. Ranked mode applies ELO gain/loss; casual mode skips all ELO processing.
 
 ---
 
@@ -25,7 +25,7 @@ This backend is part of a monorepo:
 
 ```
 cars-ranked-backend/
-├── app.ts                     # Main server file (HTTP + Socket.io + ELO + accuracy tracking) ~500 lines
+├── app.ts                     # Main server file (HTTP + Socket.io + ELO + accuracy tracking) ~850 lines
 ├── tsconfig.json              # TypeScript configuration
 ├── package.json               # Dependencies and scripts
 ├── package-lock.json          # Locked dependency versions
@@ -45,7 +45,7 @@ cars-ranked-backend/
 | **HTTP/WebSocket** | uWebSockets.js        | 20.56.0 |
 | **Real-time**      | Socket.io             | 4.8.3   |
 | **Admin UI**       | @socket.io/admin-ui   | 0.5.1   |
-| **Error Tracking** | Sentry (@sentry/node) | 10.32.1 |
+| **Error Tracking** | Sentry (@sentry/node) | 10.32.1 (dependency only; not initialized in app.ts) |
 | **Database Client**| Supabase (@supabase/supabase-js) | 2.98.0 |
 | **Language**       | TypeScript            | 5.9.3   |
 | **Dev Server**     | Nodemon + tsx         | —       |
@@ -167,11 +167,21 @@ type WaitingEntry = {
 - Consumed when a compatible player matches → `clearTimeout` + delete entry
 - Deleted + `clearTimeout` on: `cancelMatchmake`, `disconnect`, timeout expiry, periodic sweeper
 
+**`roomMatchTypes: Map<roomId, MatchType>`**
+
+Tracks match type per room for ELO decision at finish time.
+
+**Lifecycle**:
+- Set when room is created during `matchmake` (`roomMatchTypes.set(code, matchType)`)
+- Read in `playerFinished` handler to gate ELO processing (`isCasual = roomMatchTypes.get(roomId) === "casual"`)
+- Included in all `resultsReady` emissions as `matchType` field
+- Deleted on: `cancelMatchmake`, `disconnect` (when room empties), periodic 60s sweeper, and safety net cleanup
+
 **Other Maps**: `socketRoom: Map<socketId, roomId>` (for cleanup)
 
 **Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column.
 
-**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, and `roomEloResults` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms` (calls `clearTimeout` on each stale entry's timeout handle before deleting). Catches zombie rooms where sockets died without clean TCP teardown.
+**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, `roomEloResults`, and `roomMatchTypes` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms` (calls `clearTimeout` on each stale entry's timeout handle before deleting). Catches zombie rooms where sockets died without clean TCP teardown.
 
 **Important**: In-memory state is **not persisted** to disk. Server restart clears all rooms. ELO is persisted in Supabase `profiles` table.
 
@@ -182,30 +192,6 @@ type WaitingEntry = {
 ### HTTP REST Endpoints
 
 All endpoints use `uWebSockets.js` HTTP handlers.
-
-#### `GET /create`
-
-Generate a unique 5-character room code.
-
-**Request**: None
-
-**Response**:
-
-- Content-Type: `text/plain`
-- Body: 5-character uppercase hex string (e.g., `"A3F9K"`)
-
-**Logic**:
-
-```typescript
-1. Generate random 5-char code: crypto.randomBytes(20).toString('hex').slice(0, 5).toUpperCase()
-2. Check if room is empty: io.sockets.adapter.rooms.get(code)?.size ?? 0 === 0
-3. If occupied, regenerate until unique
-4. Return code
-```
-
-**Extension Usage**: Called by [`createRoom.ts`](../cars-ranked/src/background/messages/createRoom.ts) message handler.
-
----
 
 #### `POST /passage/:roomId`
 
@@ -282,7 +268,7 @@ Retrieve passage metadata for a room.
 
 ### Socket.io Events
 
-Socket.io server listens on port **3000** (hardcoded in `app.listen(3000)`).
+Socket.io server listens on port **3000** (configurable via `PORT` env var, default 3000).
 
 #### Connection Event: `connection`
 
@@ -294,10 +280,9 @@ Triggered when a client connects.
 io.sockets.on("connection", (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // Define event handlers:
   socket.on("clockSync", ...)        // NTP-style clock sync
-  socket.on("matchmake", ...)        // Auto-matchmaking
-  socket.on("cancelMatchmake", ...)  // Cancel matchmaking
+  socket.on("matchmake", ...)        // Auto-matchmaking (creates/joins rooms)
+  socket.on("cancelMatchmake", ...)  // Cancel matchmaking / exit room
   socket.on("playerFinished", ...)   // Player finished test → store time, emit results
   socket.on("disconnect", ...)       // Cleanup rooms/state
 });
@@ -317,93 +302,9 @@ NTP-style clock synchronization. Client sends its local timestamp; server echoes
 
 ---
 
-#### Client → Server: `join`
-
-Client requests to join a room.
-
-**Payload**: `roomId` (string) — 5-character room code
-
-**Server Logic**:
-
-```typescript
-1. Count current users in room: io.sockets.adapter.rooms.get(room)?.size ?? 0
-2. If numClients > 1: emit "full" (reject)
-3. Force socket to leave all other rooms (one room per socket)
-4. If numClients === 0:
-   - socket.join(room)
-   - emit "created" to this socket
-5. If numClients === 1:
-   - Broadcast "join" to existing user in room
-   - socket.join(room)
-   - emit "joined" to this socket
-6. Log join event
-```
-
-**Emitted Events** (see below): `created`, `joined`, `full`, `log`
-
-**Extension Usage**: Called by [`connectSocket.ts`](../cars-ranked/src/background/messages/connectSocket.ts) message handler.
-
----
-
-#### Server → Client: `created`
-
-Emitted to the **first user** who creates a room.
-
-**Payload**: `roomId` (string)
-
-**Extension Handler**: Background service worker updates UI state.
-
----
-
-#### Server → Client: `joined`
-
-Emitted to the **second user** who joins a room.
-
-**Payload**: `roomId` (string)
-
-**Extension Handler**: Background service worker updates UI state, confirms successful join.
-
----
-
-#### Server → Client: `join`
-
-Broadcast to **existing users in room** when a new user joins.
-
-**Payload**: `roomId` (string)
-
-**Extension Handler**: Notifies first user that second user has joined.
-
----
-
-#### Server → Client: `full`
-
-Emitted when a client tries to join a room with **2+ users** (rejected).
-
-**Payload**: `roomId` (string)
-
-**Extension Handler**: Shows error message in popup ("Room is full").
-
----
-
-#### Server → Client: `log`
-
-Debug messages from server to client console.
-
-**Payload**: `messages[]` (array of strings)
-
-**Example**:
-
-```javascript
-['>>> Message from server: ', 'Room A3F9K has 1 client(s)'];
-```
-
-**Extension Handler**: Content script logs to browser console.
-
----
-
 #### Client → Server: `matchmake`
 
-Auto-matchmaking with ELO-filtered matching: finds a compatible waiting room or creates a new one with a 30s timeout.
+Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30s timeout. Ranked uses ±15 ELO filter; casual uses first-come-first-served (no ELO filter).
 
 **Payload**: `{ userId?: string, displayName?: string, matchType?: MatchType }` — user identity for ELO tracking (stored in `socketUser` map); `matchType` defaults to `"ranked"`
 
@@ -425,6 +326,7 @@ Auto-matchmaking with ELO-filtered matching: finds a compatible waiting room or 
    - emit "matched" { roomId, role: "host", countdownEndAt } to waiting player
 6. If no compatible room:
    - Create new room, socket.join(room)
+   - roomMatchTypes.set(code, matchType) — track match type for ELO gating
    - Start 30s timeout → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
    - Store WaitingEntry { socketId, elo, matchType, timeoutHandle } in waitingRooms
    - emit "waiting" { roomId }
@@ -440,7 +342,7 @@ Cancel matchmaking or exit a room.
 
 **Payload**: None
 
-**Server Logic**: Calls `clearTimeout` on any waiting entry's timeout handle, removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes/roomEloResults, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
+**Server Logic**: Calls `clearTimeout` on any waiting entry's timeout handle, removes socket from room, deletes from waitingRooms/socketRoom/socketUser/roomPassages/roomFinishTimes/roomEloResults/roomMatchTypes, emits `partnerLeft` to remaining player if any, emits `matchmakeCancelled` to requesting socket.
 
 ---
 
@@ -464,7 +366,7 @@ Emitted when no compatible waiting room exists; player is waiting for an opponen
 
 #### Server → Client: `matchmakeTimeout`
 
-Emitted when 30 seconds elapse with no compatible match found (±15 ELO for ranked). Server cleans up the room, socket leaves room, and all maps are cleared.
+Emitted when 30 seconds elapse with no compatible match found (±15 ELO for ranked, any player for casual). Server cleans up the room, socket leaves room, and all maps are cleared.
 
 **Payload**: `{ roomId: string }`
 
@@ -499,19 +401,25 @@ Player finished the test. Server stores time + accuracy data and coordinates res
 2. Validate elapsedMs is a positive number
 3. Prevent duplicate submissions (finishMap.has(socket.id))
 4. Store PlayerFinishData { elapsedMs, accuracy, correct, incorrect, incomplete } in roomFinishTimes
-5. If finishMap.size >= ROOM_MAX_CAPACITY (both players done):
-   a. Check roomEloResults for pre-computed ELO (100% early finish case):
+5. Determine isCasual = roomMatchTypes.get(roomId) === "casual"
+6. If finishMap.size >= ROOM_MAX_CAPACITY (both players done):
+   a. Check roomEloResults for pre-computed ELO (100% early finish case, ranked only):
       - If exists: send "resultsReady" to second player (loser) with full data;
         send "opponentResults" to first player (winner) with opponent's accuracy/time
-      - If not: call processEloUpdate() (accuracy-first winner determination),
-        emit "resultsReady" to EACH socket with personalized times + accuracy + ELO
-6. If finishMap.size < ROOM_MAX_CAPACITY (first player):
-   a. If accuracy === 100: guaranteed winner
+   b. If casual: fetch profiles read-only (no ELO update), emit "resultsReady"
+      to EACH socket with myNewElo === myOldElo
+   c. If ranked (normal): call processEloUpdate() (accuracy-first winner determination),
+      emit "resultsReady" to EACH socket with personalized times + accuracy + ELO
+7. If finishMap.size < ROOM_MAX_CAPACITY (first player):
+   a. If accuracy === 100 AND ranked: guaranteed winner
       - Call processEloGuaranteed(): compute & update DB for both immediately
       - Store pre-computed ELO in roomEloResults
       - Emit "resultsReady" to winner immediately (opponentElapsedMs: -2 = still playing)
-   b. If accuracy < 100 or null: can't determine winner yet
+   b. If accuracy === 100 AND casual: send immediate results with unchanged ELO
+      (no DB writes, no roomEloResults storage)
+   c. If accuracy < 100 or null: can't determine winner yet
       - Emit "playerFinished" { roomId } to opponent (no details revealed)
+8. All "resultsReady" emissions include matchType field
 ```
 
 ---
@@ -526,12 +434,13 @@ Emitted to the opponent when the first player finishes the test. Does not reveal
 
 #### Server → Client: `resultsReady`
 
-Emitted individually to each socket when results are available. Each player receives personalized results with accuracy and ELO data. In the 100% early finish case, sent to the winner immediately (with `opponentElapsedMs: -2`) and to the loser when they finish.
+Emitted individually to each socket when results are available. Each player receives personalized results with accuracy and ELO data. In the 100% early finish case, sent to the winner immediately (with `opponentElapsedMs: -2`) and to the loser when they finish. For casual mode, `myNewElo === myOldElo` (no ELO change).
 
 **Payload**:
 ```typescript
 {
   roomId: string,
+  matchType: MatchType,          // "ranked" or "casual"
   myElapsedMs: number,
   opponentElapsedMs: number,     // -2 = opponent still playing (100% early case)
   // Accuracy data
@@ -540,7 +449,7 @@ Emitted individually to each socket when results are available. Each player rece
   opponentCorrect: number | null,
   opponentIncorrect: number | null,
   opponentIncomplete: number | null,
-  // ELO data (null if ELO processing failed)
+  // ELO data (null if ELO processing failed; for casual, myNewElo === myOldElo)
   myDisplayName: string,
   myOldElo: number | null,
   myNewElo: number | null,
@@ -586,12 +495,12 @@ Triggered when a client disconnects (browser close, network loss, etc.).
 3. If room found:
    a. clearTimeout on any waitingRooms entry for this room (prevent orphaned timers)
    b. Remove from waitingRooms
-   c. If room empty: delete roomPassages, roomFinishTimes, and roomEloResults for that room
+   c. If room empty: delete roomPassages, roomFinishTimes, roomEloResults, and roomMatchTypes for that room
    d. If room has remaining players (< capacity): emit "partnerLeft" to them
-4. Safety net: iterate roomPassages, roomFinishTimes, and roomEloResults Maps, delete entries for empty rooms
+4. Safety net: iterate roomPassages, roomFinishTimes, roomEloResults, and roomMatchTypes Maps, delete entries for empty rooms
 ```
 
-**Critical**: This is the **primary cleanup mechanism**. All in-memory state (roomPassages, roomFinishTimes, roomEloResults, waitingRooms, socketRoom) is cleaned up when rooms become empty.
+**Critical**: This is the **primary cleanup mechanism**. All in-memory state (roomPassages, roomFinishTimes, roomEloResults, roomMatchTypes, waitingRooms, socketRoom) is cleaned up when rooms become empty.
 
 ---
 
@@ -630,56 +539,17 @@ instrument(io, {
 
 ### Extension → Backend Communication Flow
 
-#### Room Creation Flow
-
-```
-Extension Background (createRoom.ts)
-  ↓ HTTP GET
-Backend: GET /create → generates "A3F9K"
-  ↓ HTTP Response
-Extension Background: Stores roomId
-  ↓
-Extension Content Script: Scans passage
-  ↓ HTTP POST
-Backend: POST /passage/A3F9K with { passageId, frameIds, passageTitle }
-  ↓ HTTP Response
-Backend: roomPassages.set("A3F9K", ...)
-  ↓ WebSocket
-Extension Background (connectSocket.ts): socket.emit("join", "A3F9K")
-  ↓ Socket.io
-Backend: socket.on("join") → emit "created"
-  ↓ WebSocket
-Extension Popup: Shows "Room created: A3F9K"
-```
-
-#### Room Joining Flow
-
-```
-Extension Background (getPassageInfo.ts)
-  ↓ HTTP GET
-Backend: GET /passage/A3F9K → { passageId, frameIds, passageTitle }
-  ↓ HTTP Response
-Extension Background: Stores passage data
-  ↓
-Extension Content Script: Navigates to passage
-  ↓ WebSocket
-Extension Background (connectSocket.ts): socket.emit("join", "A3F9K")
-  ↓ Socket.io
-Backend: socket.on("join") → emit "joined" + broadcast "join" to room
-  ↓ WebSocket
-Extension Popup: Shows "Joined room: A3F9K"
-  ↓
-Backend: Both users now in same Socket.io room
-```
+Room creation and joining is handled entirely by the `matchmake` Socket.io event. The extension emits `matchmake` with `{ userId, displayName, matchType }`, and the server either creates a new waiting room or matches with an existing compatible one. Passage data is exchanged via HTTP after matching.
 
 ### Extension Message Handlers That Call Backend
 
 | Extension Handler                                                               | Backend Endpoint/Event  | Request            | Response                  |
 | ------------------------------------------------------------------------------- | ----------------------- | ------------------ | ------------------------- |
-| [`createRoom.ts`](../cars-ranked/src/background/messages/createRoom.ts)         | `GET /create`           | None               | Room code (string)        |
+| [`matchmake.ts`](../cars-ranked/src/background/messages/matchmake.ts)           | Socket.io `matchmake`   | `{ userId, displayName, matchType }` | `waiting`/`matched`/`matchmakeTimeout` |
+| [`cancelMatchmake.ts`](../cars-ranked/src/background/messages/cancelMatchmake.ts) | Socket.io `cancelMatchmake` | None           | `matchmakeCancelled`      |
 | [`getPassageInfo.ts`](../cars-ranked/src/background/messages/getPassageInfo.ts) | `GET /passage/:roomId`  | None               | `PassageInfo` JSON        |
 | [`setPassageInfo.ts`](../cars-ranked/src/background/messages/setPassageInfo.ts) | `POST /passage/:roomId` | `PassageInfo` JSON | `{ success: true }`       |
-| [`connectSocket.ts`](../cars-ranked/src/background/messages/connectSocket.ts)   | Socket.io `join`        | `roomId` string    | `created`/`joined`/`full` |
+| [`connectSocket.ts`](../cars-ranked/src/background/messages/connectSocket.ts)   | (legacy) Maps tab→room in `tabSockets` | `{ tabId, roomCode }` | `{ success }` |
 
 For full extension details, see [`../cars-ranked/CLAUDE.md`](../cars-ranked/CLAUDE.md).
 
@@ -766,44 +636,30 @@ const io = new Server({
 
 ### Room Limits
 
-**Maximum users per room**: **2** (hardcoded in `join` event handler)
-
-```typescript
-if (numClients > 1) {
-    socket.emit('full', room); // Reject if already 2 users
-}
-```
-
-**To Change**: Modify condition in `socket.on("join")` handler.
+**Maximum users per room**: **2** (`ROOM_MAX_CAPACITY` constant in `app.ts`, used by matchmaking logic).
 
 ---
 
 ## Data Lifecycle
 
-### Room Creation
+### Room Creation (via Matchmaking)
 
 ```
-1. Extension calls GET /create
-2. Backend generates unique code (e.g., "A3F9K")
-3. Extension calls POST /passage/A3F9K
-4. Backend stores in roomPassages Map
-5. Room now exists with passage data
+1. First player emits "matchmake" { userId, displayName, matchType }
+2. Server generates room code, socket.join(room), emits "waiting"
+3. Second compatible player emits "matchmake"
+4. Server matches them, both socket.join(room), emits "matched" to both
+5. Host scans DOM for passages, POSTs to /passage/:roomId
+6. Server emits "passageReady" to room
 ```
 
 ### Room Active State
 
 ```
-1. First user: socket.emit("join", "A3F9K")
-   - Backend: socket.join("A3F9K")
-   - Backend: emit "created"
-
-2. Second user: socket.emit("join", "A3F9K")
-   - Backend: socket.join("A3F9K")
-   - Backend: broadcast "join" to first user
-   - Backend: emit "joined" to second user
-
-3. Both users in Socket.io room "A3F9K"
-4. roomPassages.get("A3F9K") contains passage data
+1. Both users matched via matchmake event → in same Socket.io room
+2. Host POSTs passage data → roomPassages.set(roomId, ...)
+3. Both users navigate to passage after countdown
+4. roomPassages.get(roomId) contains passage data
 ```
 
 ### Room Cleanup
@@ -826,10 +682,12 @@ if (numClients > 1) {
    → Extension emits playerFinished { roomId, elapsedMs, accuracy, correct, incorrect, incomplete }
    → Server stores PlayerFinishData in roomFinishTimes[roomId][socketId]
 
-2. If first player to finish with 100% accuracy (guaranteed winner):
-   → Server calls processEloGuaranteed() → computes & updates DB for both
-   → Server stores pre-computed ELO in roomEloResults
-   → Server emits "resultsReady" to winner immediately (opponentElapsedMs: -2 = still playing)
+2. If first player to finish with 100% accuracy:
+   → Ranked: Server calls processEloGuaranteed() → computes & updates DB for both
+     → Server stores pre-computed ELO in roomEloResults
+     → Server emits "resultsReady" to winner immediately (opponentElapsedMs: -2 = still playing)
+   → Casual: Server fetches profiles read-only, emits "resultsReady" with unchanged ELO
+     (no DB writes, no roomEloResults storage)
    → Server emits "playerFinished" { roomId } to opponent (no details)
    → Winner sees results with opponent card showing "Still playing..."
 
@@ -838,12 +696,15 @@ if (numClients > 1) {
    → Opponent's extension shows "Waiting for opponent..."
 
 4. If second player to finish (finishMap.size >= ROOM_MAX_CAPACITY):
-   a. If roomEloResults exists (100% early finish case):
+   a. If roomEloResults exists (100% early finish case, ranked only):
       → Server emits "resultsReady" to second player (loser) with full data + pre-computed ELO
       → Server emits "opponentResults" to first player (winner) with opponent's accuracy/time
-   b. Normal case (no pre-computed ELO):
+   b. Casual mode (no pre-computed ELO):
+      → Server fetches profiles read-only, emits "resultsReady" with myNewElo === myOldElo
+   c. Ranked normal case (no pre-computed ELO):
       → Server calls processEloUpdate() (accuracy-first winner determination)
       → Server emits personalized "resultsReady" to EACH socket with times + accuracy + ELO
+   → All "resultsReady" include matchType field
    → Both extensions show Final Results screen
 
 5. If opponent disconnects before finishing:
@@ -873,9 +734,11 @@ Server-side ELO computation and persistence via Supabase.
 - `processEloUpdate(player1, player2)` → async: fetches ELO from Supabase, determines winner (**accuracy-first**: higher accuracy wins; time tiebreaker; equal both = tie/no change), computes new ELO, updates DB, returns results for both players
 - `processEloGuaranteed(winnerSocketId, loserSocketId)` → async: called when first player finishes with 100% accuracy (guaranteed winner). Fetches ELO, computes new ELO for both, updates DB immediately, returns results. Winner sees results right away; loser sees theirs when they finish.
 
-**Flow (normal)**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (higher accuracy wins; time tiebreaker; tie = no change) → applies rank-specific delta (with loss cap at rank boundary) → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
+**Flow (ranked normal)**: When both players finish → `processEloUpdate()` called → fetches both profiles → determines winner (higher accuracy wins; time tiebreaker; tie = no change) → applies rank-specific delta (with loss cap at rank boundary) → clamps → updates `profiles.elo` → returns `{ displayName, oldElo, newElo, rank, newRank }` per player → included in `resultsReady` payload.
 
-**Flow (100% early finish)**: First player finishes with 100% accuracy → `processEloGuaranteed()` called → fetches both profiles → winner = first player (guaranteed) → computes and updates DB for both immediately → stores in `roomEloResults` → sends `resultsReady` to winner (`opponentElapsedMs: -2` = still playing) → when opponent finishes: sends `resultsReady` to loser + `opponentResults` to winner (fills in opponent's accuracy/time).
+**Flow (ranked 100% early finish)**: First player finishes with 100% accuracy → `processEloGuaranteed()` called → fetches both profiles → winner = first player (guaranteed) → computes and updates DB for both immediately → stores in `roomEloResults` → sends `resultsReady` to winner (`opponentElapsedMs: -2` = still playing) → when opponent finishes: sends `resultsReady` to loser + `opponentResults` to winner (fills in opponent's accuracy/time).
+
+**Flow (casual)**: All ELO processing skipped (`roomMatchTypes.get(roomId) === "casual"`). Server fetches profiles read-only for display names/ranks. `resultsReady` sent with `myNewElo === myOldElo`. For 100% first finisher, immediate results sent without ELO computation or `roomEloResults` storage.
 
 ---
 
@@ -894,10 +757,9 @@ Server-side ELO computation and persistence via Supabase.
 
 | Event  | Condition         | Action                          |
 | ------ | ----------------- | ------------------------------- |
-| `full` | Room has 2+ users | Reject new connection           |
 | (none) | Connection error  | Browser extension handles retry |
 
-**Sentry Integration**: All errors are automatically captured by `@sentry/node`.
+**Note**: Sentry (`@sentry/node`) is listed as a dependency but is not currently initialized in `app.ts`.
 
 ---
 
@@ -917,12 +779,11 @@ listening on *:3000
 User connected: AbCdEfGhIj123456
 ```
 
-**Room Join**:
+**Matchmaking**:
 
 ```
->>> Message from server: Room A3F9K has 0 client(s)
->>> Message from server: Request to create or join room A3F9K
-emit(): client AbCdEfGhIj123456 joined room A3F9K
+[CARS Ranked] Matchmake: AbCdEfGhIj123456 (ELO 500) joined existing room A3F9K (host ELO 485)
+[CARS Ranked] Matchmake: AbCdEfGhIj123456 (ELO 500) created new room A3F9K, waiting for opponent
 ```
 
 **Passage Storage**:
@@ -946,19 +807,7 @@ User disconnected: AbCdEfGhIj123456
 
 ### Client Logs
 
-The `log()` function sends debug messages to clients:
-
-```typescript
-function log(...messages: string[]) {
-    const array = ['>>> Message from server: '];
-    for (let i = 0; i < messages.length; i++) {
-        array.push(arguments[i]);
-    }
-    socket.emit('log', array);
-}
-```
-
-Extension content script receives these via `socket.on("log")`.
+Server uses `console.log` with `[CARS Ranked]` prefix for structured logging. No client-side `log()` relay function exists in the current codebase.
 
 ---
 
@@ -967,10 +816,7 @@ Extension content script receives these via `socket.on("log")`.
 ### Verify Server Running
 
 ```bash
-curl http://localhost:3000/create
-# Should return: "A3F9K" (or similar)
-
-curl http://localhost:3000/passage/A3F9K
+curl http://localhost:3000/passage/TEST1
 # Should return: {"error":"Room not found"}
 ```
 
@@ -988,7 +834,7 @@ wscat -c ws://localhost:3000/socket.io/?EIO=4&transport=websocket
 **Admin UI**: http://localhost:3000/admin
 
 - Username: `admin`
-- Password: Value from `.env` (plaintext, not hash)
+- Password: Enter the **plaintext** password (admin UI handles comparison against the bcrypt hash in `.env`)
 
 ### Common Issues
 
@@ -1011,7 +857,8 @@ lsof -ti:3000 | xargs kill -9  # Kill process on port 3000
 
 **Admin password not working**:
 
-- `.env` should contain **plaintext** password, not bcrypt hash
+- `.env` must contain a **bcrypt hash** of the password (used by `@socket.io/admin-ui` `instrument()`)
+- Enter the **plaintext** password in the admin UI login form
 - Restart server after changing `.env`
 
 ---
@@ -1141,7 +988,7 @@ npm start
 
 ### Recommendations
 
-1. **Rate Limiting**: Add per-IP limits for `/create`
+1. **Rate Limiting**: Add per-IP limits for matchmaking
 2. **Room Expiration**: Auto-delete rooms after X hours
 3. **CORS Restriction**: Whitelist specific origins
 4. **Input Validation**: Sanitize room codes, passage IDs

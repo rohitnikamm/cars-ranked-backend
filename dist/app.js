@@ -44,6 +44,8 @@ const socketRoom = new Map();
 // Track player finish data per room: roomId -> Map<socketId, PlayerFinishData>
 const roomFinishTimes = new Map();
 const roomEloResults = new Map();
+// Track match type per room for ELO decision at finish time
+const roomMatchTypes = new Map();
 // Track socket -> authenticated user identity
 const socketUser = new Map();
 function getRank(elo) {
@@ -277,6 +279,13 @@ setInterval(() => {
             roomPassages.delete(roomId);
             roomFinishTimes.delete(roomId);
             roomEloResults.delete(roomId);
+            roomMatchTypes.delete(roomId);
+            cleaned++;
+        }
+    }
+    for (const [roomId] of roomMatchTypes) {
+        if (isEmpty(roomId)) {
+            roomMatchTypes.delete(roomId);
             cleaned++;
         }
     }
@@ -370,6 +379,7 @@ io.sockets.on("connection", (socket) => {
             }
             socket.join(code);
             socketRoom.set(socket.id, code);
+            roomMatchTypes.set(code, matchType);
             // Start timeout — if no match found within MATCHMAKE_TIMEOUT_MS, notify client
             const timeoutHandle = setTimeout(() => {
                 socket.emit("matchmakeTimeout", { roomId: code });
@@ -402,6 +412,7 @@ io.sockets.on("connection", (socket) => {
         roomPassages.delete(roomId);
         roomFinishTimes.delete(roomId);
         roomEloResults.delete(roomId);
+        roomMatchTypes.delete(roomId);
         // If someone else was in the room (rare race), notify them
         if (roomSize > 1) {
             io.sockets.in(roomId).emit("partnerLeft", { roomId });
@@ -411,7 +422,7 @@ io.sockets.on("connection", (socket) => {
     });
     // Player finished the test
     socket.on("playerFinished", (_a) => __awaiter(void 0, [_a], void 0, function* ({ roomId, elapsedMs, accuracy, correct, incorrect, incomplete, }) {
-        var _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, _21;
+        var _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, _21, _22, _23, _24, _25, _26, _27, _28, _29, _30, _31, _32, _33, _34, _35, _36, _37, _38, _39;
         const actualRoom = socketRoom.get(socket.id);
         if (!actualRoom || actualRoom !== roomId)
             return;
@@ -433,6 +444,8 @@ io.sockets.on("connection", (socket) => {
         };
         finishMap.set(socket.id, playerData);
         console.log(`[CARS Ranked] Player ${socket.id} finished in room ${roomId}: ${elapsedMs}ms, accuracy=${accuracy}%`);
+        const isCasual = roomMatchTypes.get(roomId) === "casual";
+        const roomMatchType = (_b = roomMatchTypes.get(roomId)) !== null && _b !== void 0 ? _b : "ranked";
         if (finishMap.size >= ROOM_MAX_CAPACITY) {
             // Both players finished
             const entries = Array.from(finishMap.entries());
@@ -447,8 +460,9 @@ io.sockets.on("connection", (socket) => {
                 const secondElo = preComputedElo[secondSid];
                 const firstElo = preComputedElo[firstSid];
                 // Send full results to second player (the loser)
-                (_b = io.sockets.sockets.get(secondSid)) === null || _b === void 0 ? void 0 : _b.emit("resultsReady", {
+                (_c = io.sockets.sockets.get(secondSid)) === null || _c === void 0 ? void 0 : _c.emit("resultsReady", {
                     roomId,
+                    matchType: roomMatchType,
                     myElapsedMs: secondData.elapsedMs,
                     opponentElapsedMs: firstData.elapsedMs,
                     myAccuracy: secondData.accuracy,
@@ -456,19 +470,19 @@ io.sockets.on("connection", (socket) => {
                     opponentCorrect: firstData.correct,
                     opponentIncorrect: firstData.incorrect,
                     opponentIncomplete: firstData.incomplete,
-                    myDisplayName: (_e = (_c = secondElo === null || secondElo === void 0 ? void 0 : secondElo.displayName) !== null && _c !== void 0 ? _c : (_d = socketUser.get(secondSid)) === null || _d === void 0 ? void 0 : _d.displayName) !== null && _e !== void 0 ? _e : "Unknown",
-                    myOldElo: (_f = secondElo === null || secondElo === void 0 ? void 0 : secondElo.oldElo) !== null && _f !== void 0 ? _f : null,
-                    myNewElo: (_g = secondElo === null || secondElo === void 0 ? void 0 : secondElo.newElo) !== null && _g !== void 0 ? _g : null,
-                    myRank: (_h = secondElo === null || secondElo === void 0 ? void 0 : secondElo.rank) !== null && _h !== void 0 ? _h : null,
-                    myNewRank: (_j = secondElo === null || secondElo === void 0 ? void 0 : secondElo.newRank) !== null && _j !== void 0 ? _j : null,
-                    opponentDisplayName: (_m = (_k = firstElo === null || firstElo === void 0 ? void 0 : firstElo.displayName) !== null && _k !== void 0 ? _k : (_l = socketUser.get(firstSid)) === null || _l === void 0 ? void 0 : _l.displayName) !== null && _m !== void 0 ? _m : "Unknown",
-                    opponentOldElo: (_o = firstElo === null || firstElo === void 0 ? void 0 : firstElo.oldElo) !== null && _o !== void 0 ? _o : null,
-                    opponentNewElo: (_p = firstElo === null || firstElo === void 0 ? void 0 : firstElo.newElo) !== null && _p !== void 0 ? _p : null,
-                    opponentRank: (_q = firstElo === null || firstElo === void 0 ? void 0 : firstElo.rank) !== null && _q !== void 0 ? _q : null,
-                    opponentNewRank: (_r = firstElo === null || firstElo === void 0 ? void 0 : firstElo.newRank) !== null && _r !== void 0 ? _r : null,
+                    myDisplayName: (_f = (_d = secondElo === null || secondElo === void 0 ? void 0 : secondElo.displayName) !== null && _d !== void 0 ? _d : (_e = socketUser.get(secondSid)) === null || _e === void 0 ? void 0 : _e.displayName) !== null && _f !== void 0 ? _f : "Unknown",
+                    myOldElo: (_g = secondElo === null || secondElo === void 0 ? void 0 : secondElo.oldElo) !== null && _g !== void 0 ? _g : null,
+                    myNewElo: (_h = secondElo === null || secondElo === void 0 ? void 0 : secondElo.newElo) !== null && _h !== void 0 ? _h : null,
+                    myRank: (_j = secondElo === null || secondElo === void 0 ? void 0 : secondElo.rank) !== null && _j !== void 0 ? _j : null,
+                    myNewRank: (_k = secondElo === null || secondElo === void 0 ? void 0 : secondElo.newRank) !== null && _k !== void 0 ? _k : null,
+                    opponentDisplayName: (_o = (_l = firstElo === null || firstElo === void 0 ? void 0 : firstElo.displayName) !== null && _l !== void 0 ? _l : (_m = socketUser.get(firstSid)) === null || _m === void 0 ? void 0 : _m.displayName) !== null && _o !== void 0 ? _o : "Unknown",
+                    opponentOldElo: (_p = firstElo === null || firstElo === void 0 ? void 0 : firstElo.oldElo) !== null && _p !== void 0 ? _p : null,
+                    opponentNewElo: (_q = firstElo === null || firstElo === void 0 ? void 0 : firstElo.newElo) !== null && _q !== void 0 ? _q : null,
+                    opponentRank: (_r = firstElo === null || firstElo === void 0 ? void 0 : firstElo.rank) !== null && _r !== void 0 ? _r : null,
+                    opponentNewRank: (_s = firstElo === null || firstElo === void 0 ? void 0 : firstElo.newRank) !== null && _s !== void 0 ? _s : null,
                 });
                 // Send opponent data update to first player (the winner)
-                (_s = io.sockets.sockets.get(firstSid)) === null || _s === void 0 ? void 0 : _s.emit("opponentResults", {
+                (_t = io.sockets.sockets.get(firstSid)) === null || _t === void 0 ? void 0 : _t.emit("opponentResults", {
                     roomId,
                     opponentElapsedMs: secondData.elapsedMs,
                     opponentAccuracy: secondData.accuracy,
@@ -479,16 +493,28 @@ io.sockets.on("connection", (socket) => {
                 roomEloResults.delete(roomId);
                 console.log(`[CARS Ranked] Results sent for room ${roomId} (early ELO path)`);
             }
-            else {
-                // Normal case: both finished, process ELO now
-                const eloResults = yield processEloUpdate({ socketId: entries[0][0], data: entries[0][1] }, { socketId: entries[1][0], data: entries[1][1] });
+            else if (isCasual) {
+                // Casual mode: no ELO changes — fetch profiles read-only for display
+                const user1 = socketUser.get(entries[0][0]);
+                const user2 = socketUser.get(entries[1][0]);
+                let profiles = [];
+                if (user1 && user2) {
+                    const { data } = yield supabaseAdmin
+                        .from("profiles")
+                        .select("id, elo, display_name")
+                        .in("id", [user1.userId, user2.userId]);
+                    profiles = data !== null && data !== void 0 ? data : [];
+                }
                 for (const [sid, data] of entries) {
                     const opponentSid = entries.find(([s]) => s !== sid)[0];
                     const opponentData = entries.find(([s]) => s !== sid)[1];
-                    const myElo = eloResults === null || eloResults === void 0 ? void 0 : eloResults[sid];
-                    const opElo = eloResults === null || eloResults === void 0 ? void 0 : eloResults[opponentSid];
-                    (_t = io.sockets.sockets.get(sid)) === null || _t === void 0 ? void 0 : _t.emit("resultsReady", {
+                    const myUser = socketUser.get(sid);
+                    const opUser = socketUser.get(opponentSid);
+                    const myProfile = profiles.find((p) => p.id === (myUser === null || myUser === void 0 ? void 0 : myUser.userId));
+                    const opProfile = profiles.find((p) => p.id === (opUser === null || opUser === void 0 ? void 0 : opUser.userId));
+                    (_u = io.sockets.sockets.get(sid)) === null || _u === void 0 ? void 0 : _u.emit("resultsReady", {
                         roomId,
+                        matchType: roomMatchType,
                         myElapsedMs: data.elapsedMs,
                         opponentElapsedMs: opponentData.elapsedMs,
                         myAccuracy: data.accuracy,
@@ -496,16 +522,48 @@ io.sockets.on("connection", (socket) => {
                         opponentCorrect: opponentData.correct,
                         opponentIncorrect: opponentData.incorrect,
                         opponentIncomplete: opponentData.incomplete,
-                        myDisplayName: (_w = (_u = myElo === null || myElo === void 0 ? void 0 : myElo.displayName) !== null && _u !== void 0 ? _u : (_v = socketUser.get(sid)) === null || _v === void 0 ? void 0 : _v.displayName) !== null && _w !== void 0 ? _w : "Unknown",
-                        myOldElo: (_x = myElo === null || myElo === void 0 ? void 0 : myElo.oldElo) !== null && _x !== void 0 ? _x : null,
-                        myNewElo: (_y = myElo === null || myElo === void 0 ? void 0 : myElo.newElo) !== null && _y !== void 0 ? _y : null,
-                        myRank: (_z = myElo === null || myElo === void 0 ? void 0 : myElo.rank) !== null && _z !== void 0 ? _z : null,
-                        myNewRank: (_0 = myElo === null || myElo === void 0 ? void 0 : myElo.newRank) !== null && _0 !== void 0 ? _0 : null,
-                        opponentDisplayName: (_3 = (_1 = opElo === null || opElo === void 0 ? void 0 : opElo.displayName) !== null && _1 !== void 0 ? _1 : (_2 = socketUser.get(opponentSid)) === null || _2 === void 0 ? void 0 : _2.displayName) !== null && _3 !== void 0 ? _3 : "Unknown",
-                        opponentOldElo: (_4 = opElo === null || opElo === void 0 ? void 0 : opElo.oldElo) !== null && _4 !== void 0 ? _4 : null,
-                        opponentNewElo: (_5 = opElo === null || opElo === void 0 ? void 0 : opElo.newElo) !== null && _5 !== void 0 ? _5 : null,
-                        opponentRank: (_6 = opElo === null || opElo === void 0 ? void 0 : opElo.rank) !== null && _6 !== void 0 ? _6 : null,
-                        opponentNewRank: (_7 = opElo === null || opElo === void 0 ? void 0 : opElo.newRank) !== null && _7 !== void 0 ? _7 : null,
+                        myDisplayName: (_w = (_v = myProfile === null || myProfile === void 0 ? void 0 : myProfile.display_name) !== null && _v !== void 0 ? _v : myUser === null || myUser === void 0 ? void 0 : myUser.displayName) !== null && _w !== void 0 ? _w : "Unknown",
+                        myOldElo: (_x = myProfile === null || myProfile === void 0 ? void 0 : myProfile.elo) !== null && _x !== void 0 ? _x : null,
+                        myNewElo: (_y = myProfile === null || myProfile === void 0 ? void 0 : myProfile.elo) !== null && _y !== void 0 ? _y : null,
+                        myRank: myProfile ? getRank(myProfile.elo) : null,
+                        myNewRank: myProfile ? getRank(myProfile.elo) : null,
+                        opponentDisplayName: (_0 = (_z = opProfile === null || opProfile === void 0 ? void 0 : opProfile.display_name) !== null && _z !== void 0 ? _z : opUser === null || opUser === void 0 ? void 0 : opUser.displayName) !== null && _0 !== void 0 ? _0 : "Unknown",
+                        opponentOldElo: (_1 = opProfile === null || opProfile === void 0 ? void 0 : opProfile.elo) !== null && _1 !== void 0 ? _1 : null,
+                        opponentNewElo: (_2 = opProfile === null || opProfile === void 0 ? void 0 : opProfile.elo) !== null && _2 !== void 0 ? _2 : null,
+                        opponentRank: opProfile ? getRank(opProfile.elo) : null,
+                        opponentNewRank: opProfile ? getRank(opProfile.elo) : null,
+                    });
+                }
+                console.log(`[CARS Ranked] Casual results sent for room ${roomId} (no ELO change)`);
+            }
+            else {
+                // Ranked: both finished, process ELO now
+                const eloResults = yield processEloUpdate({ socketId: entries[0][0], data: entries[0][1] }, { socketId: entries[1][0], data: entries[1][1] });
+                for (const [sid, data] of entries) {
+                    const opponentSid = entries.find(([s]) => s !== sid)[0];
+                    const opponentData = entries.find(([s]) => s !== sid)[1];
+                    const myElo = eloResults === null || eloResults === void 0 ? void 0 : eloResults[sid];
+                    const opElo = eloResults === null || eloResults === void 0 ? void 0 : eloResults[opponentSid];
+                    (_3 = io.sockets.sockets.get(sid)) === null || _3 === void 0 ? void 0 : _3.emit("resultsReady", {
+                        roomId,
+                        matchType: roomMatchType,
+                        myElapsedMs: data.elapsedMs,
+                        opponentElapsedMs: opponentData.elapsedMs,
+                        myAccuracy: data.accuracy,
+                        opponentAccuracy: opponentData.accuracy,
+                        opponentCorrect: opponentData.correct,
+                        opponentIncorrect: opponentData.incorrect,
+                        opponentIncomplete: opponentData.incomplete,
+                        myDisplayName: (_6 = (_4 = myElo === null || myElo === void 0 ? void 0 : myElo.displayName) !== null && _4 !== void 0 ? _4 : (_5 = socketUser.get(sid)) === null || _5 === void 0 ? void 0 : _5.displayName) !== null && _6 !== void 0 ? _6 : "Unknown",
+                        myOldElo: (_7 = myElo === null || myElo === void 0 ? void 0 : myElo.oldElo) !== null && _7 !== void 0 ? _7 : null,
+                        myNewElo: (_8 = myElo === null || myElo === void 0 ? void 0 : myElo.newElo) !== null && _8 !== void 0 ? _8 : null,
+                        myRank: (_9 = myElo === null || myElo === void 0 ? void 0 : myElo.rank) !== null && _9 !== void 0 ? _9 : null,
+                        myNewRank: (_10 = myElo === null || myElo === void 0 ? void 0 : myElo.newRank) !== null && _10 !== void 0 ? _10 : null,
+                        opponentDisplayName: (_13 = (_11 = opElo === null || opElo === void 0 ? void 0 : opElo.displayName) !== null && _11 !== void 0 ? _11 : (_12 = socketUser.get(opponentSid)) === null || _12 === void 0 ? void 0 : _12.displayName) !== null && _13 !== void 0 ? _13 : "Unknown",
+                        opponentOldElo: (_14 = opElo === null || opElo === void 0 ? void 0 : opElo.oldElo) !== null && _14 !== void 0 ? _14 : null,
+                        opponentNewElo: (_15 = opElo === null || opElo === void 0 ? void 0 : opElo.newElo) !== null && _15 !== void 0 ? _15 : null,
+                        opponentRank: (_16 = opElo === null || opElo === void 0 ? void 0 : opElo.rank) !== null && _16 !== void 0 ? _16 : null,
+                        opponentNewRank: (_17 = opElo === null || opElo === void 0 ? void 0 : opElo.newRank) !== null && _17 !== void 0 ? _17 : null,
                     });
                 }
                 console.log(`[CARS Ranked] Results + ELO sent for room ${roomId}`);
@@ -513,7 +571,7 @@ io.sockets.on("connection", (socket) => {
         }
         else {
             // First player finished — check for 100% guaranteed win
-            if (accuracy !== null && accuracy === 100) {
+            if (accuracy !== null && accuracy === 100 && !isCasual) {
                 // Find opponent socket ID from the room
                 const roomSockets = io.sockets.adapter.rooms.get(roomId);
                 let opponentSid = null;
@@ -535,6 +593,7 @@ io.sockets.on("connection", (socket) => {
                         // Send results to winner immediately (opponent data pending)
                         socket.emit("resultsReady", {
                             roomId,
+                            matchType: roomMatchType,
                             myElapsedMs: elapsedMs,
                             opponentElapsedMs: -2, // -2 = opponent still playing
                             myAccuracy: accuracy,
@@ -542,19 +601,68 @@ io.sockets.on("connection", (socket) => {
                             opponentCorrect: null,
                             opponentIncorrect: null,
                             opponentIncomplete: null,
-                            myDisplayName: (_10 = (_8 = myElo === null || myElo === void 0 ? void 0 : myElo.displayName) !== null && _8 !== void 0 ? _8 : (_9 = socketUser.get(socket.id)) === null || _9 === void 0 ? void 0 : _9.displayName) !== null && _10 !== void 0 ? _10 : "Unknown",
-                            myOldElo: (_11 = myElo === null || myElo === void 0 ? void 0 : myElo.oldElo) !== null && _11 !== void 0 ? _11 : null,
-                            myNewElo: (_12 = myElo === null || myElo === void 0 ? void 0 : myElo.newElo) !== null && _12 !== void 0 ? _12 : null,
-                            myRank: (_13 = myElo === null || myElo === void 0 ? void 0 : myElo.rank) !== null && _13 !== void 0 ? _13 : null,
-                            myNewRank: (_14 = myElo === null || myElo === void 0 ? void 0 : myElo.newRank) !== null && _14 !== void 0 ? _14 : null,
-                            opponentDisplayName: (_17 = (_15 = opElo === null || opElo === void 0 ? void 0 : opElo.displayName) !== null && _15 !== void 0 ? _15 : (_16 = socketUser.get(opponentSid)) === null || _16 === void 0 ? void 0 : _16.displayName) !== null && _17 !== void 0 ? _17 : "Unknown",
-                            opponentOldElo: (_18 = opElo === null || opElo === void 0 ? void 0 : opElo.oldElo) !== null && _18 !== void 0 ? _18 : null,
-                            opponentNewElo: (_19 = opElo === null || opElo === void 0 ? void 0 : opElo.newElo) !== null && _19 !== void 0 ? _19 : null,
-                            opponentRank: (_20 = opElo === null || opElo === void 0 ? void 0 : opElo.rank) !== null && _20 !== void 0 ? _20 : null,
-                            opponentNewRank: (_21 = opElo === null || opElo === void 0 ? void 0 : opElo.newRank) !== null && _21 !== void 0 ? _21 : null,
+                            myDisplayName: (_20 = (_18 = myElo === null || myElo === void 0 ? void 0 : myElo.displayName) !== null && _18 !== void 0 ? _18 : (_19 = socketUser.get(socket.id)) === null || _19 === void 0 ? void 0 : _19.displayName) !== null && _20 !== void 0 ? _20 : "Unknown",
+                            myOldElo: (_21 = myElo === null || myElo === void 0 ? void 0 : myElo.oldElo) !== null && _21 !== void 0 ? _21 : null,
+                            myNewElo: (_22 = myElo === null || myElo === void 0 ? void 0 : myElo.newElo) !== null && _22 !== void 0 ? _22 : null,
+                            myRank: (_23 = myElo === null || myElo === void 0 ? void 0 : myElo.rank) !== null && _23 !== void 0 ? _23 : null,
+                            myNewRank: (_24 = myElo === null || myElo === void 0 ? void 0 : myElo.newRank) !== null && _24 !== void 0 ? _24 : null,
+                            opponentDisplayName: (_27 = (_25 = opElo === null || opElo === void 0 ? void 0 : opElo.displayName) !== null && _25 !== void 0 ? _25 : (_26 = socketUser.get(opponentSid)) === null || _26 === void 0 ? void 0 : _26.displayName) !== null && _27 !== void 0 ? _27 : "Unknown",
+                            opponentOldElo: (_28 = opElo === null || opElo === void 0 ? void 0 : opElo.oldElo) !== null && _28 !== void 0 ? _28 : null,
+                            opponentNewElo: (_29 = opElo === null || opElo === void 0 ? void 0 : opElo.newElo) !== null && _29 !== void 0 ? _29 : null,
+                            opponentRank: (_30 = opElo === null || opElo === void 0 ? void 0 : opElo.rank) !== null && _30 !== void 0 ? _30 : null,
+                            opponentNewRank: (_31 = opElo === null || opElo === void 0 ? void 0 : opElo.newRank) !== null && _31 !== void 0 ? _31 : null,
                         });
                         console.log(`[CARS Ranked] 100% accuracy: immediate ELO for room ${roomId}`);
                     }
+                }
+            }
+            else if (accuracy !== null && accuracy === 100 && isCasual) {
+                // Casual 100%: send results immediately but with no ELO changes
+                const roomSockets = io.sockets.adapter.rooms.get(roomId);
+                let opponentSid = null;
+                if (roomSockets) {
+                    for (const sid of roomSockets) {
+                        if (sid !== socket.id) {
+                            opponentSid = sid;
+                            break;
+                        }
+                    }
+                }
+                if (opponentSid) {
+                    const myUser = socketUser.get(socket.id);
+                    const opUser = socketUser.get(opponentSid);
+                    let profiles = [];
+                    if (myUser && opUser) {
+                        const { data } = yield supabaseAdmin
+                            .from("profiles")
+                            .select("id, elo, display_name")
+                            .in("id", [myUser.userId, opUser.userId]);
+                        profiles = data !== null && data !== void 0 ? data : [];
+                    }
+                    const myProfile = profiles.find((p) => p.id === (myUser === null || myUser === void 0 ? void 0 : myUser.userId));
+                    const opProfile = profiles.find((p) => p.id === (opUser === null || opUser === void 0 ? void 0 : opUser.userId));
+                    socket.emit("resultsReady", {
+                        roomId,
+                        matchType: roomMatchType,
+                        myElapsedMs: elapsedMs,
+                        opponentElapsedMs: -2,
+                        myAccuracy: accuracy,
+                        opponentAccuracy: null,
+                        opponentCorrect: null,
+                        opponentIncorrect: null,
+                        opponentIncomplete: null,
+                        myDisplayName: (_33 = (_32 = myProfile === null || myProfile === void 0 ? void 0 : myProfile.display_name) !== null && _32 !== void 0 ? _32 : myUser === null || myUser === void 0 ? void 0 : myUser.displayName) !== null && _33 !== void 0 ? _33 : "Unknown",
+                        myOldElo: (_34 = myProfile === null || myProfile === void 0 ? void 0 : myProfile.elo) !== null && _34 !== void 0 ? _34 : null,
+                        myNewElo: (_35 = myProfile === null || myProfile === void 0 ? void 0 : myProfile.elo) !== null && _35 !== void 0 ? _35 : null,
+                        myRank: myProfile ? getRank(myProfile.elo) : null,
+                        myNewRank: myProfile ? getRank(myProfile.elo) : null,
+                        opponentDisplayName: (_37 = (_36 = opProfile === null || opProfile === void 0 ? void 0 : opProfile.display_name) !== null && _36 !== void 0 ? _36 : opUser === null || opUser === void 0 ? void 0 : opUser.displayName) !== null && _37 !== void 0 ? _37 : "Unknown",
+                        opponentOldElo: (_38 = opProfile === null || opProfile === void 0 ? void 0 : opProfile.elo) !== null && _38 !== void 0 ? _38 : null,
+                        opponentNewElo: (_39 = opProfile === null || opProfile === void 0 ? void 0 : opProfile.elo) !== null && _39 !== void 0 ? _39 : null,
+                        opponentRank: opProfile ? getRank(opProfile.elo) : null,
+                        opponentNewRank: opProfile ? getRank(opProfile.elo) : null,
+                    });
+                    console.log(`[CARS Ranked] Casual 100% accuracy: immediate results for room ${roomId} (no ELO change)`);
                 }
             }
             // Notify opponent that this player finished (no details revealed)
@@ -580,6 +688,7 @@ io.sockets.on("connection", (socket) => {
                 roomPassages.delete(roomId);
                 roomFinishTimes.delete(roomId);
                 roomEloResults.delete(roomId);
+                roomMatchTypes.delete(roomId);
                 console.log(`[CARS Ranked] Cleaned up empty room ${roomId}`);
             }
             else if (roomSize < ROOM_MAX_CAPACITY) {
@@ -602,6 +711,11 @@ io.sockets.on("connection", (socket) => {
         roomEloResults.forEach((_, rid) => {
             if (isEmpty(rid)) {
                 roomEloResults.delete(rid);
+            }
+        });
+        roomMatchTypes.forEach((_, rid) => {
+            if (isEmpty(rid)) {
+                roomMatchTypes.delete(rid);
             }
         });
     });
