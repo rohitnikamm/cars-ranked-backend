@@ -42,8 +42,27 @@ const waitingRooms = new Set<string>();
 // Track which socket is in which room (socketId -> roomId)
 const socketRoom = new Map<string, string>();
 
-// Track player finish times per room: roomId -> Map<socketId, elapsedMs>
-const roomFinishTimes = new Map<string, Map<string, number>>();
+// Player finish data (time + accuracy)
+type PlayerFinishData = {
+	elapsedMs: number;
+	accuracy: number | null;
+	correct: number | null;
+	incorrect: number | null;
+	incomplete: number | null;
+};
+
+// Track player finish data per room: roomId -> Map<socketId, PlayerFinishData>
+const roomFinishTimes = new Map<string, Map<string, PlayerFinishData>>();
+
+// Pre-computed ELO results for 100% guaranteed-win early finish
+type EloResult = {
+	displayName: string;
+	oldElo: number;
+	newElo: number;
+	rank: string;
+	newRank: string;
+};
+const roomEloResults = new Map<string, Record<string, EloResult>>();
 
 // Track socket -> authenticated user identity
 const socketUser = new Map<string, { userId: string; displayName: string }>();
@@ -72,8 +91,8 @@ function computeNewElo(currentElo: number, won: boolean): number {
 }
 
 async function processEloUpdate(
-	player1: { socketId: string; elapsedMs: number },
-	player2: { socketId: string; elapsedMs: number },
+	player1: { socketId: string; data: PlayerFinishData },
+	player2: { socketId: string; data: PlayerFinishData },
 ) {
 	const user1 = socketUser.get(player1.socketId);
 	const user2 = socketUser.get(player2.socketId);
@@ -89,14 +108,28 @@ async function processEloUpdate(
 	const profile1 = profiles.find((p) => p.id === user1.userId)!;
 	const profile2 = profiles.find((p) => p.id === user2.userId)!;
 
-	// Determine winner (lower elapsed time wins; both must be positive)
-	const p1Won =
-		player1.elapsedMs > 0 &&
-		(player2.elapsedMs < 0 || player1.elapsedMs < player2.elapsedMs);
-	const p2Won =
-		player2.elapsedMs > 0 &&
-		(player1.elapsedMs < 0 || player2.elapsedMs < player1.elapsedMs);
-	const isTie = !p1Won && !p2Won && player1.elapsedMs > 0 && player2.elapsedMs > 0;
+	// Determine winner: PRIMARY = higher accuracy, TIEBREAKER = faster time
+	const acc1 = player1.data.accuracy ?? 0;
+	const acc2 = player2.data.accuracy ?? 0;
+
+	let p1Won = false;
+	let p2Won = false;
+	let isTie = false;
+
+	if (acc1 > acc2) {
+		p1Won = true;
+	} else if (acc2 > acc1) {
+		p2Won = true;
+	} else {
+		// Equal accuracy — tiebreak by time (lower is better)
+		if (player1.data.elapsedMs < player2.data.elapsedMs) {
+			p1Won = true;
+		} else if (player2.data.elapsedMs < player1.data.elapsedMs) {
+			p2Won = true;
+		} else {
+			isTie = true;
+		}
+	}
 
 	const newElo1 = isTie ? profile1.elo : computeNewElo(profile1.elo, p1Won);
 	const newElo2 = isTie ? profile2.elo : computeNewElo(profile2.elo, p2Won);
@@ -120,6 +153,54 @@ async function processEloUpdate(
 			newElo: newElo2,
 			rank: getRank(profile2.elo),
 			newRank: getRank(newElo2),
+		},
+	};
+}
+
+/**
+ * Process ELO when winner is already known (100% guaranteed win).
+ * Fetches profiles, computes ELO, updates DB.
+ */
+async function processEloGuaranteed(
+	winnerSocketId: string,
+	loserSocketId: string,
+) {
+	const winnerUser = socketUser.get(winnerSocketId);
+	const loserUser = socketUser.get(loserSocketId);
+	if (!winnerUser || !loserUser) return null;
+
+	const { data: profiles, error } = await supabaseAdmin
+		.from("profiles")
+		.select("id, elo, display_name")
+		.in("id", [winnerUser.userId, loserUser.userId]);
+
+	if (error || !profiles || profiles.length < 2) return null;
+
+	const winnerProfile = profiles.find((p) => p.id === winnerUser.userId)!;
+	const loserProfile = profiles.find((p) => p.id === loserUser.userId)!;
+
+	const newWinnerElo = computeNewElo(winnerProfile.elo, true);
+	const newLoserElo = computeNewElo(loserProfile.elo, false);
+
+	await Promise.all([
+		supabaseAdmin.from("profiles").update({ elo: newWinnerElo }).eq("id", winnerUser.userId),
+		supabaseAdmin.from("profiles").update({ elo: newLoserElo }).eq("id", loserUser.userId),
+	]);
+
+	return {
+		[winnerSocketId]: {
+			displayName: winnerProfile.display_name,
+			oldElo: winnerProfile.elo,
+			newElo: newWinnerElo,
+			rank: getRank(winnerProfile.elo),
+			newRank: getRank(newWinnerElo),
+		},
+		[loserSocketId]: {
+			displayName: loserProfile.display_name,
+			oldElo: loserProfile.elo,
+			newElo: newLoserElo,
+			rank: getRank(loserProfile.elo),
+			newRank: getRank(newLoserElo),
 		},
 	};
 }
@@ -237,6 +318,7 @@ setInterval(() => {
 		if (isEmpty(roomId)) {
 			roomPassages.delete(roomId);
 			roomFinishTimes.delete(roomId);
+			roomEloResults.delete(roomId);
 			cleaned++;
 		}
 	}
@@ -332,6 +414,7 @@ io.sockets.on("connection", (socket) => {
 		waitingRooms.delete(roomId);
 		roomPassages.delete(roomId);
 		roomFinishTimes.delete(roomId);
+		roomEloResults.delete(roomId);
 
 		// If someone else was in the room (rare race), notify them
 		if (roomSize > 1) {
@@ -346,7 +429,21 @@ io.sockets.on("connection", (socket) => {
 	});
 
 	// Player finished the test
-	socket.on("playerFinished", async ({ roomId, elapsedMs }: { roomId: string; elapsedMs: number }) => {
+	socket.on("playerFinished", async ({
+		roomId,
+		elapsedMs,
+		accuracy,
+		correct,
+		incorrect,
+		incomplete,
+	}: {
+		roomId: string;
+		elapsedMs: number;
+		accuracy: number | null;
+		correct: number | null;
+		incorrect: number | null;
+		incomplete: number | null;
+	}) => {
 		const actualRoom = socketRoom.get(socket.id);
 		if (!actualRoom || actualRoom !== roomId) return;
 		if (typeof elapsedMs !== "number" || elapsedMs <= 0) return;
@@ -359,43 +456,155 @@ io.sockets.on("connection", (socket) => {
 		// Prevent duplicate submissions
 		if (finishMap.has(socket.id)) return;
 
-		finishMap.set(socket.id, elapsedMs);
-		console.log(`[CARS Ranked] Player ${socket.id} finished in room ${roomId}: ${elapsedMs}ms`);
+		const playerData: PlayerFinishData = {
+			elapsedMs,
+			accuracy: accuracy ?? null,
+			correct: correct ?? null,
+			incorrect: incorrect ?? null,
+			incomplete: incomplete ?? null,
+		};
+		finishMap.set(socket.id, playerData);
+		console.log(`[CARS Ranked] Player ${socket.id} finished in room ${roomId}: ${elapsedMs}ms, accuracy=${accuracy}%`);
 
 		if (finishMap.size >= ROOM_MAX_CAPACITY) {
-			// Both players finished — process ELO and send results
+			// Both players finished
 			const entries = Array.from(finishMap.entries());
 
-			const eloResults = await processEloUpdate(
-				{ socketId: entries[0][0], elapsedMs: entries[0][1] },
-				{ socketId: entries[1][0], elapsedMs: entries[1][1] },
-			);
+			// Check if ELO was already processed (100% early finish case)
+			const preComputedElo = roomEloResults.get(roomId);
 
-			for (const [sid, time] of entries) {
-				const opponentSid = entries.find(([s]) => s !== sid)![0];
-				const opponentTime = entries.find(([s]) => s !== sid)?.[1] ?? 0;
-				const myElo = eloResults?.[sid];
-				const opElo = eloResults?.[opponentSid];
+			if (preComputedElo) {
+				// ELO already computed for this room (first player got 100%)
+				const secondSid = socket.id;
+				const firstSid = entries.find(([s]) => s !== secondSid)![0];
+				const secondData = finishMap.get(secondSid)!;
+				const firstData = finishMap.get(firstSid)!;
 
-				io.sockets.sockets.get(sid)?.emit("resultsReady", {
+				const secondElo = preComputedElo[secondSid];
+				const firstElo = preComputedElo[firstSid];
+
+				// Send full results to second player (the loser)
+				io.sockets.sockets.get(secondSid)?.emit("resultsReady", {
 					roomId,
-					myElapsedMs: time,
-					opponentElapsedMs: opponentTime,
-					myDisplayName: myElo?.displayName ?? socketUser.get(sid)?.displayName ?? "Unknown",
-					myOldElo: myElo?.oldElo ?? null,
-					myNewElo: myElo?.newElo ?? null,
-					myRank: myElo?.rank ?? null,
-					myNewRank: myElo?.newRank ?? null,
-					opponentDisplayName: opElo?.displayName ?? socketUser.get(opponentSid)?.displayName ?? "Unknown",
-					opponentOldElo: opElo?.oldElo ?? null,
-					opponentNewElo: opElo?.newElo ?? null,
-					opponentRank: opElo?.rank ?? null,
-					opponentNewRank: opElo?.newRank ?? null,
+					myElapsedMs: secondData.elapsedMs,
+					opponentElapsedMs: firstData.elapsedMs,
+					myAccuracy: secondData.accuracy,
+					opponentAccuracy: firstData.accuracy,
+					opponentCorrect: firstData.correct,
+					opponentIncorrect: firstData.incorrect,
+					opponentIncomplete: firstData.incomplete,
+					myDisplayName: secondElo?.displayName ?? socketUser.get(secondSid)?.displayName ?? "Unknown",
+					myOldElo: secondElo?.oldElo ?? null,
+					myNewElo: secondElo?.newElo ?? null,
+					myRank: secondElo?.rank ?? null,
+					myNewRank: secondElo?.newRank ?? null,
+					opponentDisplayName: firstElo?.displayName ?? socketUser.get(firstSid)?.displayName ?? "Unknown",
+					opponentOldElo: firstElo?.oldElo ?? null,
+					opponentNewElo: firstElo?.newElo ?? null,
+					opponentRank: firstElo?.rank ?? null,
+					opponentNewRank: firstElo?.newRank ?? null,
 				});
+
+				// Send opponent data update to first player (the winner)
+				io.sockets.sockets.get(firstSid)?.emit("opponentResults", {
+					roomId,
+					opponentElapsedMs: secondData.elapsedMs,
+					opponentAccuracy: secondData.accuracy,
+					opponentCorrect: secondData.correct,
+					opponentIncorrect: secondData.incorrect,
+					opponentIncomplete: secondData.incomplete,
+				});
+
+				roomEloResults.delete(roomId);
+				console.log(`[CARS Ranked] Results sent for room ${roomId} (early ELO path)`);
+			} else {
+				// Normal case: both finished, process ELO now
+				const eloResults = await processEloUpdate(
+					{ socketId: entries[0][0], data: entries[0][1] },
+					{ socketId: entries[1][0], data: entries[1][1] },
+				);
+
+				for (const [sid, data] of entries) {
+					const opponentSid = entries.find(([s]) => s !== sid)![0];
+					const opponentData = entries.find(([s]) => s !== sid)![1];
+					const myElo = eloResults?.[sid];
+					const opElo = eloResults?.[opponentSid];
+
+					io.sockets.sockets.get(sid)?.emit("resultsReady", {
+						roomId,
+						myElapsedMs: data.elapsedMs,
+						opponentElapsedMs: opponentData.elapsedMs,
+						myAccuracy: data.accuracy,
+						opponentAccuracy: opponentData.accuracy,
+						opponentCorrect: opponentData.correct,
+						opponentIncorrect: opponentData.incorrect,
+						opponentIncomplete: opponentData.incomplete,
+						myDisplayName: myElo?.displayName ?? socketUser.get(sid)?.displayName ?? "Unknown",
+						myOldElo: myElo?.oldElo ?? null,
+						myNewElo: myElo?.newElo ?? null,
+						myRank: myElo?.rank ?? null,
+						myNewRank: myElo?.newRank ?? null,
+						opponentDisplayName: opElo?.displayName ?? socketUser.get(opponentSid)?.displayName ?? "Unknown",
+						opponentOldElo: opElo?.oldElo ?? null,
+						opponentNewElo: opElo?.newElo ?? null,
+						opponentRank: opElo?.rank ?? null,
+						opponentNewRank: opElo?.newRank ?? null,
+					});
+				}
+				console.log(`[CARS Ranked] Results + ELO sent for room ${roomId}`);
 			}
-			console.log(`[CARS Ranked] Results + ELO sent for room ${roomId}`);
 		} else {
-			// First player finished — notify opponent (no time revealed)
+			// First player finished — check for 100% guaranteed win
+			if (accuracy !== null && accuracy === 100) {
+				// Find opponent socket ID from the room
+				const roomSockets = io.sockets.adapter.rooms.get(roomId);
+				let opponentSid: string | null = null;
+				if (roomSockets) {
+					for (const sid of roomSockets) {
+						if (sid !== socket.id) {
+							opponentSid = sid;
+							break;
+						}
+					}
+				}
+
+				if (opponentSid) {
+					// Compute ELO immediately — this player is the guaranteed winner
+					const eloResults = await processEloGuaranteed(socket.id, opponentSid);
+
+					if (eloResults) {
+						roomEloResults.set(roomId, eloResults);
+
+						const myElo = eloResults[socket.id];
+						const opElo = eloResults[opponentSid];
+
+						// Send results to winner immediately (opponent data pending)
+						socket.emit("resultsReady", {
+							roomId,
+							myElapsedMs: elapsedMs,
+							opponentElapsedMs: -2, // -2 = opponent still playing
+							myAccuracy: accuracy,
+							opponentAccuracy: null,
+							opponentCorrect: null,
+							opponentIncorrect: null,
+							opponentIncomplete: null,
+							myDisplayName: myElo?.displayName ?? socketUser.get(socket.id)?.displayName ?? "Unknown",
+							myOldElo: myElo?.oldElo ?? null,
+							myNewElo: myElo?.newElo ?? null,
+							myRank: myElo?.rank ?? null,
+							myNewRank: myElo?.newRank ?? null,
+							opponentDisplayName: opElo?.displayName ?? socketUser.get(opponentSid)?.displayName ?? "Unknown",
+							opponentOldElo: opElo?.oldElo ?? null,
+							opponentNewElo: opElo?.newElo ?? null,
+							opponentRank: opElo?.rank ?? null,
+							opponentNewRank: opElo?.newRank ?? null,
+						});
+						console.log(`[CARS Ranked] 100% accuracy: immediate ELO for room ${roomId}`);
+					}
+				}
+			}
+
+			// Notify opponent that this player finished (no details revealed)
 			socket.to(roomId).emit("playerFinished", { roomId });
 			console.log(`[CARS Ranked] Notified opponent in room ${roomId} that a player finished`);
 		}
@@ -415,6 +624,7 @@ io.sockets.on("connection", (socket) => {
 			if (roomSize === 0) {
 				roomPassages.delete(roomId);
 				roomFinishTimes.delete(roomId);
+				roomEloResults.delete(roomId);
 				console.log(`[CARS Ranked] Cleaned up empty room ${roomId}`);
 			} else if (roomSize < ROOM_MAX_CAPACITY) {
 				// Partner left — notify remaining players
@@ -434,6 +644,11 @@ io.sockets.on("connection", (socket) => {
 		roomFinishTimes.forEach((_, rid) => {
 			if (isEmpty(rid)) {
 				roomFinishTimes.delete(rid);
+			}
+		});
+		roomEloResults.forEach((_, rid) => {
+			if (isEmpty(rid)) {
+				roomEloResults.delete(rid);
 			}
 		});
 	});
