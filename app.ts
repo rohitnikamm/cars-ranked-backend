@@ -13,9 +13,19 @@ const supabaseAdmin = createClient(
 );
 
 const app = App();
+const ALLOWED_ORIGINS = [
+	"chrome-extension://lphcjalbgllpmnocjhhgimfkmefjheif", // Dev
+	"chrome-extension://hokcincgnecdhjpnomajaafblpbfpmjb", // Prod
+];
 const io = new Server({
 	cors: {
-		origin: true,
+		origin: (origin, callback) => {
+			if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+				callback(null, true);
+			} else {
+				callback(new Error("CORS origin not allowed"));
+			}
+		},
 		credentials: true,
 		methods: ["GET"],
 	},
@@ -53,9 +63,38 @@ function isRankedWindowOpen(): boolean {
 	return RANKED_WINDOWS.some((w) => hour >= w.startHour && hour < w.endHour);
 }
 
-// Generate random 5-char room code
-const random = () =>
-	crypto.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
+// Generate random 10-char alphanumeric room code (62^10 ≈ 8.4×10^17 combinations)
+const ROOM_CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const ROOM_CODE_LENGTH = 10;
+const random = () => {
+	const bytes = crypto.randomBytes(ROOM_CODE_LENGTH);
+	return Array.from(bytes, (b) => ROOM_CODE_CHARS[b % ROOM_CODE_CHARS.length]).join("");
+};
+
+// Room code format validation
+const ROOM_CODE_REGEX = /^[A-Za-z0-9]{5,12}$/;
+function isValidRoomCode(roomId: string): boolean {
+	return ROOM_CODE_REGEX.test(roomId);
+}
+
+// Simple per-socket rate limiter
+const socketRateLimits = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW_MS = 10_000; // 10 seconds
+const RATE_LIMIT_MAX = 5; // max events per window
+
+function isRateLimited(socketId: string): boolean {
+	const now = Date.now();
+	const entry = socketRateLimits.get(socketId);
+	if (!entry || now >= entry.resetAt) {
+		socketRateLimits.set(socketId, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+		return false;
+	}
+	entry.count++;
+	return entry.count > RATE_LIMIT_MAX;
+}
+
+// Valid match types
+const VALID_MATCH_TYPES: MatchType[] = ["ranked", "casual"];
 
 // Store passage information per room
 const roomPassages = new Map<
@@ -270,13 +309,20 @@ function getRoomSize(room: string) {
 	return io.sockets.adapter.rooms.get(room)?.size ?? 0;
 }
 
+// Security headers helper
+function writeSecurityHeaders(res: import("uWebSockets.js").HttpResponse) {
+	res.writeHeader("X-Content-Type-Options", "nosniff");
+	res.writeHeader("X-Frame-Options", "DENY");
+	res.writeHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+}
+
 // Store passage info for a room
 app.post("/passage/:roomId", (res, req) => {
 	const roomId = req.getParameter(0);
 
-	if (!roomId) {
+	if (!roomId || !isValidRoomCode(roomId)) {
 		res.writeStatus("400 Bad Request");
-		res.end(JSON.stringify({ error: "Room ID is required" }));
+		res.end(JSON.stringify({ error: "Invalid room ID" }));
 		return;
 	}
 
@@ -291,11 +337,17 @@ app.post("/passage/:roomId", (res, req) => {
 				const body = JSON.parse(buffer.toString());
 				const { passageId, frameIds, passageTitle, passageHref } = body;
 
-				if (!passageId || !frameIds) {
+				if (!passageId || !frameIds || !Array.isArray(frameIds) || frameIds.length === 0 || frameIds.length > 20) {
 					res.writeStatus("400 Bad Request");
 					res.end(
-						JSON.stringify({ error: "passageId and frameIds are required" }),
+						JSON.stringify({ error: "passageId and frameIds (array, 1-20 items) are required" }),
 					);
+					return;
+				}
+
+				if (typeof passageId !== "string" || passageId.length > 200) {
+					res.writeStatus("400 Bad Request");
+					res.end(JSON.stringify({ error: "Invalid passageId" }));
 					return;
 				}
 
@@ -310,10 +362,12 @@ app.post("/passage/:roomId", (res, req) => {
 					.emit("passageReady", { roomId, passageId, frameIds, passageTitle, passageHref });
 
 				res.writeStatus("200 OK");
+				writeSecurityHeaders(res);
 				res.writeHeader("Content-Type", "application/json");
 				res.end(JSON.stringify({ success: true }));
 			} catch (error) {
 				res.writeStatus("400 Bad Request");
+				writeSecurityHeaders(res);
 				res.end(JSON.stringify({ error: "Invalid JSON" }));
 			}
 		}
@@ -328,9 +382,9 @@ app.post("/passage/:roomId", (res, req) => {
 app.get("/passage/:roomId", (res, req) => {
 	const roomId = req.getParameter(0);
 
-	if (!roomId) {
+	if (!roomId || !isValidRoomCode(roomId)) {
 		res.writeStatus("400 Bad Request");
-		res.end(JSON.stringify({ error: "Room ID is required" }));
+		res.end(JSON.stringify({ error: "Invalid room ID" }));
 		return;
 	}
 
@@ -339,6 +393,7 @@ app.get("/passage/:roomId", (res, req) => {
 	if (!passageInfo) {
 		console.log(`[CARS Ranked] No passage found for room ${roomId}`);
 		res.writeStatus("404 Not Found");
+		writeSecurityHeaders(res);
 		res.writeHeader("Content-Type", "application/json");
 		res.end(JSON.stringify({ error: "Room not found" }));
 		return;
@@ -348,6 +403,7 @@ app.get("/passage/:roomId", (res, req) => {
 		`[CARS Ranked] Retrieved passage for room ${roomId}: ${passageInfo.passageId}`,
 	);
 	res.writeStatus("200 OK");
+	writeSecurityHeaders(res);
 	res.writeHeader("Content-Type", "application/json");
 	res.end(JSON.stringify(passageInfo));
 });
@@ -392,6 +448,14 @@ setInterval(() => {
 			cleaned++;
 		}
 	}
+	// Clean up expired rate limit entries
+	const now = Date.now();
+	for (const [socketId, entry] of socketRateLimits) {
+		if (now >= entry.resetAt) {
+			socketRateLimits.delete(socketId);
+			cleaned++;
+		}
+	}
 	if (cleaned > 0) {
 		console.log(`[CARS Ranked] Periodic cleanup: removed ${cleaned} stale entries`);
 	}
@@ -407,6 +471,18 @@ io.sockets.on("connection", (socket) => {
 
 	// Matchmaking: find an open room or create a new one
 	socket.on("matchmake", async ({ userId, displayName, matchType = "ranked" }: { userId?: string; displayName?: string; matchType?: MatchType } = {}) => {
+		// Rate limit
+		if (isRateLimited(socket.id)) {
+			socket.emit("error", { message: "Too many requests. Please slow down." });
+			return;
+		}
+
+		// Validate matchType
+		if (!VALID_MATCH_TYPES.includes(matchType)) {
+			socket.emit("error", { message: "Invalid match type" });
+			return;
+		}
+
 		if (userId && displayName) {
 			socketUser.set(socket.id, { userId, displayName });
 		}
@@ -473,11 +549,11 @@ io.sockets.on("connection", (socket) => {
 				// Cancel the waiting player's timeout
 				const waitingEntry = waitingRooms.get(assignedRoom)!;
 				clearTimeout(waitingEntry.timeoutHandle);
+				waitingRooms.delete(assignedRoom); // Delete BEFORE join to prevent race
 
 				// Join existing room
 				socket.join(assignedRoom);
 				socketRoom.set(socket.id, assignedRoom);
-				waitingRooms.delete(assignedRoom); // Room is now full
 
 				console.log(
 					`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) joined existing room ${assignedRoom} (host ELO ${waitingEntry.elo})`,
@@ -575,9 +651,26 @@ io.sockets.on("connection", (socket) => {
 		incorrect: number | null;
 		incomplete: number | null;
 	}) => {
+		// Rate limit
+		if (isRateLimited(socket.id)) return;
+
+		// Validate roomId format
+		if (typeof roomId !== "string" || !isValidRoomCode(roomId)) return;
+
 		const actualRoom = socketRoom.get(socket.id);
 		if (!actualRoom || actualRoom !== roomId) return;
 		if (typeof elapsedMs !== "number" || elapsedMs <= 0) return;
+
+		// Validate elapsedMs upper bound (max 4 hours = 14,400,000ms)
+		if (elapsedMs > 14_400_000) return;
+
+		// Validate accuracy range
+		if (accuracy !== null && (typeof accuracy !== "number" || accuracy < 0 || accuracy > 100)) return;
+
+		// Validate correct/incorrect/incomplete are non-negative integers if provided
+		for (const val of [correct, incorrect, incomplete]) {
+			if (val !== null && (typeof val !== "number" || val < 0 || !Number.isInteger(val) || val > 1000)) return;
+		}
 
 		if (!roomFinishTimes.has(roomId)) {
 			roomFinishTimes.set(roomId, new Map());

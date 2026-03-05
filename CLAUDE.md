@@ -182,7 +182,7 @@ Tracks match type per room for ELO decision at finish time.
 
 **Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column.
 
-**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, `roomEloResults`, and `roomMatchTypes` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms` (calls `clearTimeout` on each stale entry's timeout handle before deleting). Catches zombie rooms where sockets died without clean TCP teardown.
+**Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, `roomEloResults`, and `roomMatchTypes` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms` (calls `clearTimeout` on each stale entry's timeout handle before deleting) and expired `socketRateLimits` entries. Catches zombie rooms where sockets died without clean TCP teardown.
 
 **Important**: In-memory state is **not persisted** to disk. Server restart clears all rooms. ELO is persisted in Supabase `profiles` table.
 
@@ -200,7 +200,7 @@ Store passage metadata for a room.
 
 **URL Parameters**:
 
-- `roomId` (string) — 5-character room code
+- `roomId` (string) — 10-character alphanumeric room code (validated against `/^[A-Za-z0-9]{5,12}$/`)
 
 **Request Body** (JSON):
 
@@ -215,17 +215,19 @@ Store passage metadata for a room.
 **Response**:
 
 - **200 OK**: `{ "success": true }`
-- **400 Bad Request**: `{ "error": "passageId and frameIds are required" }`
+- **400 Bad Request**: `{ "error": "Invalid room ID" }` (invalid format)
+- **400 Bad Request**: `{ "error": "passageId and frameIds (array, 1-20 items) are required" }`
+- **400 Bad Request**: `{ "error": "Invalid passageId" }` (non-string or >200 chars)
 - **400 Bad Request**: `{ "error": "Invalid JSON" }`
 
 **Logic**:
 
 ```typescript
-1. Extract roomId from URL parameter
+1. Extract roomId from URL parameter, validate format
 2. Parse JSON body (streamed via res.onData)
-3. Validate passageId and frameIds are present
-4. Store in roomPassages.set(roomId, { passageId, frameIds, passageTitle })
-5. Log: "[CARS Ranked] Stored passage for room {roomId}: {passageId}"
+3. Validate passageId (string, max 200 chars) and frameIds (array, 1-20 items)
+4. Store in roomPassages.set(roomId, { passageId, frameIds, passageTitle, passageHref })
+5. Emit "passageReady" to room, respond with security headers
 ```
 
 **Extension Usage**: Called by [`setPassageInfo.ts`](../cars-ranked/src/background/messages/setPassageInfo.ts) after user creates room.
@@ -238,7 +240,7 @@ Retrieve passage metadata for a room.
 
 **URL Parameters**:
 
-- `roomId` (string) — 5-character room code
+- `roomId` (string) — 10-character alphanumeric room code (validated against `/^[A-Za-z0-9]{5,12}$/`)
 
 **Response**:
 
@@ -251,16 +253,15 @@ Retrieve passage metadata for a room.
     }
     ```
 - **404 Not Found**: `{ "error": "Room not found" }`
-- **400 Bad Request**: `{ "error": "Room ID is required" }`
+- **400 Bad Request**: `{ "error": "Invalid room ID" }`
 
 **Logic**:
 
 ```typescript
-1. Extract roomId from URL parameter
+1. Extract roomId from URL parameter, validate format
 2. Lookup roomPassages.get(roomId)
-3. If not found, return 404
-4. Return passage info as JSON
-5. Log: "[CARS Ranked] Retrieved passage for room {roomId}: {passageId}"
+3. If not found, return 404 with security headers
+4. Return passage info as JSON with security headers
 ```
 
 **Extension Usage**: Called by [`getPassageInfo.ts`](../cars-ranked/src/background/messages/getPassageInfo.ts) when user joins existing room.
@@ -312,23 +313,26 @@ Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30
 **Server Logic**:
 
 ```typescript
-1. Store userId/displayName in socketUser map (if provided)
-2. Acquire async mutex (matchmakingInProgress Set) — prevents concurrent processing of duplicate matchmake events from the same socket
-3. Check if socket already in a room (prevent double-matchmake)
-4. Fetch player's authoritative ELO from Supabase (tamper-proof): profiles.elo (default 472)
-5. Search waitingRooms for compatible room:
+1. Rate limit check (5 events per 10s window per socket) — reject with error if exceeded
+2. Validate matchType is "ranked" or "casual" — reject with error if invalid
+3. Store userId/displayName in socketUser map (if provided)
+4. Acquire async mutex (matchmakingInProgress Set) — prevents concurrent processing of duplicate matchmake events from the same socket
+5. Check if socket already in a room (prevent double-matchmake)
+6. If ranked: check isRankedWindowOpen() — reject with "matchmakeRejected" if outside window
+7. Fetch player's authoritative ELO from Supabase (tamper-proof): profiles.elo (default 472)
+8. Search waitingRooms for compatible room:
    - Must match matchType
    - Never match a socket with itself (entry.socketId !== socket.id)
    - For ranked: bidirectional ±ELO_RANGE check (Math.abs(playerElo - entry.elo) <= 15)
    - For casual: no ELO filter
    - Clean up stale entries (roomSize === 0) during iteration
-6. If compatible room found:
-   - clearTimeout(waitingEntry.timeoutHandle) — cancel waiting player's 30s timer
+9. If compatible room found:
+   - clearTimeout(waitingEntry.timeoutHandle) + waitingRooms.delete() BEFORE socket.join() (race condition prevention)
    - socket.join(room), compute countdownEndAt = Date.now() + COUNTDOWN_MS
    - emit "matched" { roomId, role: "guest", countdownEndAt } to joining player
    - emit "matched" { roomId, role: "host", countdownEndAt } to waiting player
-7. If no compatible room:
-   - Create new room, socket.join(room)
+10. If no compatible room:
+   - Create new 10-char alphanumeric room code, socket.join(room)
    - roomMatchTypes.set(code, matchType) — track match type for ELO gating
    - Start 30s timeout → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
    - Store WaitingEntry { socketId, elo, matchType, timeoutHandle } in waitingRooms
@@ -400,9 +404,12 @@ Player finished the test. Server stores time + accuracy data and coordinates res
 **Server Logic**:
 
 ```typescript
-1. Validate socket is in this room via socketRoom
-2. Validate elapsedMs is a positive number
-3. Prevent duplicate submissions (finishMap.has(socket.id))
+1. Rate limit check (5 events per 10s window per socket)
+2. Validate roomId format (alphanumeric, 5-12 chars)
+3. Validate socket is in this room via socketRoom
+4. Validate elapsedMs is a positive number, max 14,400,000ms (4 hours)
+5. Validate accuracy range (0-100 or null), correct/incorrect/incomplete (non-negative integers, max 1000, or null)
+6. Prevent duplicate submissions (finishMap.has(socket.id))
 4. Store PlayerFinishData { elapsedMs, accuracy, correct, incorrect, incomplete } in roomFinishTimes
 5. Determine isCasual = roomMatchTypes.get(roomId) === "casual"
 6. If finishMap.size >= ROOM_MAX_CAPACITY (both players done):
@@ -620,19 +627,27 @@ PLASMO_PUBLIC_SOCKET_ENDPOINT="http://localhost:<NEW_PORT>"
 
 ### CORS
 
-Socket.io configured with permissive CORS (required for browser extension):
+Socket.io CORS is whitelisted to extension origins only:
 
 ```typescript
+const ALLOWED_ORIGINS = [
+    "chrome-extension://lphcjalbgllpmnocjhhgimfkmefjheif", // Dev
+    "chrome-extension://hokcincgnecdhjpnomajaafblpbfpmjb", // Prod
+];
 const io = new Server({
     cors: {
-        origin: true, // Allow all origins
-        credentials: true, // Allow credentials
-        methods: ['GET'], // Only GET for CORS preflight
+        origin: (origin, callback) => {
+            if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+                callback(null, true);
+            } else {
+                callback(new Error("CORS origin not allowed"));
+            }
+        },
+        credentials: true,
+        methods: ['GET'],
     },
 });
 ```
-
-**Security Note**: In production, restrict `origin` to specific domains.
 
 ### Room Limits
 
@@ -748,9 +763,10 @@ Server-side ELO computation and persistence via Supabase.
 
 | Status          | Condition                  | Response                                           |
 | --------------- | -------------------------- | -------------------------------------------------- |
-| 400 Bad Request | Missing room ID            | `{ error: "Room ID is required" }`                 |
+| 400 Bad Request | Invalid room ID format     | `{ error: "Invalid room ID" }`                     |
 | 400 Bad Request | Invalid JSON body          | `{ error: "Invalid JSON" }`                        |
-| 400 Bad Request | Missing passageId/frameIds | `{ error: "passageId and frameIds are required" }` |
+| 400 Bad Request | Missing/invalid passageId/frameIds | `{ error: "passageId and frameIds (array, 1-20 items) are required" }` |
+| 400 Bad Request | Invalid passageId          | `{ error: "Invalid passageId" }`                   |
 | 404 Not Found   | Room doesn't exist         | `{ error: "Room not found" }`                      |
 
 ### Socket.io Errors
@@ -846,7 +862,8 @@ lsof -ti:3000 | xargs kill -9  # Kill process on port 3000
 
 **CORS errors**:
 
-- Verify `cors: { origin: true }` in Socket.io config
+- CORS is whitelisted to extension IDs — verify the requesting origin is in `ALLOWED_ORIGINS` array in `app.ts`
+- For local dev, ensure the dev extension ID (`lphcjalbgllpmnocjhhgimfkmefjheif`) is in the whitelist
 - Check browser console for specific CORS error
 
 **Room not found (404)**:
@@ -986,19 +1003,22 @@ npm run build:full   # Compile + upload Sentry sourcemaps
 
 ### Current Security Posture
 
-- **No socket authentication**: Anyone can create/join rooms with code (user identity sent voluntarily with matchmake)
+- **CORS**: Whitelisted to dev/prod extension IDs only (not permissive)
+- **Rate limiting**: Per-socket rate limiting (5 events per 10s window) on `matchmake` and `playerFinished` events. Expired entries cleaned up by periodic 60s sweeper.
+- **Input validation**: `playerFinished` data validated (accuracy 0-100, elapsedMs max 4h, non-negative integers for correct/incorrect/incomplete). `matchType` validated against `["ranked", "casual"]`. `roomId` format validated on HTTP endpoints (`/^[A-Za-z0-9]{5,12}$/`). `frameIds` validated as array with max 20 items. `passageId` validated as string with max 200 chars.
+- **Room code entropy**: 10-character alphanumeric codes (62^10 ≈ 8.4×10^17 combinations), generated with `crypto.randomBytes`
+- **Race condition prevention**: `waitingRooms` entry deleted before `socket.join()` to prevent concurrent matchers from finding the same room
+- **HTTP security headers**: All responses include `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Strict-Transport-Security`
+- **Source maps**: `inlineSources` disabled in tsconfig to prevent source code exposure in production
 - **Supabase service role key**: Used server-side only for ELO updates (bypasses RLS); never exposed to client
 - **Ephemeral data**: Passage info deleted when room empties; ELO persisted in Supabase
-- **No rate limiting**: Vulnerable to abuse (room creation spam)
-- **Permissive CORS**: Allows all origins
+- **No socket authentication**: User identity sent voluntarily with matchmake (not JWT-verified)
 
-### Recommendations
+### Remaining Recommendations
 
-1. **Rate Limiting**: Add per-IP limits for matchmaking
-2. **Room Expiration**: Auto-delete rooms after X hours
-3. **CORS Restriction**: Whitelist specific origins
-4. **Input Validation**: Sanitize room codes, passage IDs
-5. **Admin UI**: Add authentication middleware (beyond basic auth)
+1. **Socket JWT Authentication**: Validate Supabase access token on socket `connection` event to prevent impersonation
+2. **Admin UI hardening**: Add rate limiting on failed login attempts, consider IP whitelisting
+3. **Server-side accuracy verification**: Currently trusts client-reported accuracy; ideally verify independently
 
 ---
 
