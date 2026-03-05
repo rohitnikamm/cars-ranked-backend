@@ -159,6 +159,7 @@ type WaitingEntry = {
     socketId: string;           // Waiting player's socket ID
     elo: number;                // Player's ELO (fetched server-side from Supabase)
     matchType: MatchType;       // "ranked" (±15 ELO filter) or "casual" (no filter)
+    isTest: boolean;            // Test user flag — test users only match with other test users
     timeoutHandle: ReturnType<typeof setTimeout>;  // 30s matchmake timeout
 };
 ```
@@ -180,7 +181,7 @@ Tracks match type per room for ELO decision at finish time.
 
 **Other Maps**: `socketRoom: Map<socketId, roomId>` (for cleanup), `matchmakingInProgress: Set<socketId>` (async mutex — prevents concurrent processing of duplicate matchmake events from the same socket; entries added before async work and removed in `finally` block)
 
-**Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column.
+**Supabase Admin Client**: `supabaseAdmin` — initialized with service role key (bypasses RLS). Used by `processEloUpdate()` and `processEloGuaranteed()` to read/write `profiles.elo` column. Also reads `profiles.is_test` during matchmaking for test user isolation.
 
 **Periodic Stale Room Sweeper**: Runs every 60s. Iterates `roomPassages`, `roomFinishTimes`, `roomEloResults`, and `roomMatchTypes` Maps; deletes entries for rooms with 0 sockets. Also cleans `waitingRooms` (calls `clearTimeout` on each stale entry's timeout handle before deleting) and expired `socketRateLimits` entries. Catches zombie rooms where sockets died without clean TCP teardown.
 
@@ -319,9 +320,10 @@ Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30
 4. Acquire async mutex (matchmakingInProgress Set) — prevents concurrent processing of duplicate matchmake events from the same socket
 5. Check if socket already in a room (prevent double-matchmake)
 6. If ranked: check isRankedWindowOpen() — reject with "matchmakeRejected" if outside window
-7. Fetch player's authoritative ELO from Supabase (tamper-proof): profiles.elo (default 472)
+7. Fetch player's authoritative ELO and is_test flag from Supabase (tamper-proof): profiles.elo (default 472), profiles.is_test (default false)
 8. Search waitingRooms for compatible room:
    - Must match matchType
+   - Must match isTest flag (test users only match with test users)
    - Never match a socket with itself (entry.socketId !== socket.id)
    - For ranked: bidirectional ±ELO_RANGE check (Math.abs(playerElo - entry.elo) <= 15)
    - For casual: no ELO filter
@@ -335,7 +337,7 @@ Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30
    - Create new 10-char alphanumeric room code, socket.join(room)
    - roomMatchTypes.set(code, matchType) — track match type for ELO gating
    - Start 30s timeout → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
-   - Store WaitingEntry { socketId, elo, matchType, timeoutHandle } in waitingRooms
+   - Store WaitingEntry { socketId, elo, matchType, isTest, timeoutHandle } in waitingRooms
    - emit "waiting" { roomId }
 ```
 
@@ -732,7 +734,7 @@ const io = new Server({
 
 Server-side ELO computation and persistence via Supabase.
 
-**Database**: `public.profiles.elo` — integer column, default 472, CHECK constraint [472, 528]
+**Database**: `public.profiles.elo` — integer column, default 472, CHECK constraint [472, 528]. `public.profiles.is_test` — boolean column, default false; test users are isolated in matchmaking (only match with other test users) and excluded from the frontend leaderboard.
 
 **Ranks and Deltas**:
 

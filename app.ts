@@ -107,6 +107,7 @@ type WaitingEntry = {
 	socketId: string;
 	elo: number;
 	matchType: MatchType;
+	isTest: boolean;
 	timeoutHandle: ReturnType<typeof setTimeout>;
 };
 const waitingRooms = new Map<string, WaitingEntry>();
@@ -504,17 +505,21 @@ io.sockets.on("connection", (socket) => {
 				return;
 			}
 
-			// Fetch authoritative ELO from Supabase (tamper-proof)
+			// Fetch authoritative ELO and test flag from Supabase (tamper-proof)
 			let playerElo = 472; // default
+			let playerIsTest = false;
 			if (userId) {
 				try {
 					const { data } = await supabaseAdmin
 						.from("profiles")
-						.select("elo")
+						.select("elo, is_test")
 						.eq("id", userId)
 						.single();
 					if (data?.elo != null) {
 						playerElo = data.elo;
+					}
+					if (data?.is_test != null) {
+						playerIsTest = data.is_test;
 					}
 				} catch (err) {
 					console.warn(`[CARS Ranked] Failed to fetch ELO for ${userId}, using default:`, err);
@@ -525,6 +530,8 @@ io.sockets.on("connection", (socket) => {
 			let assignedRoom: string | null = null;
 			for (const [roomId, entry] of waitingRooms) {
 				if (entry.matchType !== matchType) continue;
+				// Never match test users with real users (and vice versa)
+				if (entry.isTest !== playerIsTest) continue;
 				// Never match a socket with itself
 				if (entry.socketId === socket.id) continue;
 				const roomSize = getRoomSize(roomId);
@@ -588,7 +595,7 @@ io.sockets.on("connection", (socket) => {
 					);
 				}, MATCHMAKE_TIMEOUT_MS);
 
-				waitingRooms.set(code, { socketId: socket.id, elo: playerElo, matchType, timeoutHandle });
+				waitingRooms.set(code, { socketId: socket.id, elo: playerElo, matchType, isTest: playerIsTest, timeoutHandle });
 
 				console.log(
 					`[CARS Ranked] Matchmake: ${socket.id} (ELO ${playerElo}) created new room ${code}, waiting for opponent`,
