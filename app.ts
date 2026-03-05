@@ -31,6 +31,28 @@ const ELO_RANGE = 15;
 // Match types (ranked = ELO-filtered, casual = first-come-first-served)
 type MatchType = "ranked" | "casual";
 
+// Ranked matchmaking window configuration (mirrors cars-ranked/src/utils/rankedWindows.ts)
+const RANKED_WINDOWS = [
+	{ startHour: 10, endHour: 12 },
+	{ startHour: 20, endHour: 22 },
+] as const;
+const RANKED_TIMEZONE = "America/Chicago";
+
+// Returns the current hour in US Central Time (0-23), DST-safe
+function getCTHour(): number {
+	const parts = new Intl.DateTimeFormat("en-US", {
+		timeZone: RANKED_TIMEZONE,
+		hour: "numeric",
+		hour12: false
+	}).formatToParts(new Date());
+	return parseInt(parts.find((p) => p.type === "hour")!.value, 10);
+}
+
+function isRankedWindowOpen(): boolean {
+	const hour = getCTHour();
+	return RANKED_WINDOWS.some((w) => hour >= w.startHour && hour < w.endHour);
+}
+
 // Generate random 5-char room code
 const random = () =>
 	crypto.randomBytes(20).toString("hex").slice(0, 5).toUpperCase();
@@ -397,6 +419,12 @@ io.sockets.on("connection", (socket) => {
 			// Prevent double-matchmaking
 			if (socketRoom.has(socket.id)) {
 				socket.emit("error", { message: "Already in matchmaking" });
+				return;
+			}
+
+			// Reject ranked matchmaking outside window hours
+			if (matchType === "ranked" && !isRankedWindowOpen()) {
+				socket.emit("matchmakeRejected", { reason: "ranked_closed" });
 				return;
 			}
 
