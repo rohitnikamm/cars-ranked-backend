@@ -301,6 +301,69 @@ async function processEloGuaranteed(
 	};
 }
 
+/**
+ * Write match history rows to Supabase (2 rows per match, one per player).
+ * Fire-and-forget — does not block results emission.
+ */
+function writeMatchHistory(
+	matchType: MatchType,
+	player1: { userId: string; displayName: string; data: PlayerFinishData; oldElo: number | null; newElo: number | null },
+	player2: { userId: string; displayName: string; data: PlayerFinishData; oldElo: number | null; newElo: number | null },
+) {
+	const acc1 = player1.data.accuracy ?? 0;
+	const acc2 = player2.data.accuracy ?? 0;
+
+	let p1Result: "win" | "loss" | "tie";
+	if (acc1 > acc2) {
+		p1Result = "win";
+	} else if (acc2 > acc1) {
+		p1Result = "loss";
+	} else if (player1.data.elapsedMs < player2.data.elapsedMs) {
+		p1Result = "win";
+	} else if (player2.data.elapsedMs < player1.data.elapsedMs) {
+		p1Result = "loss";
+	} else {
+		p1Result = "tie";
+	}
+	const p2Result = p1Result === "win" ? "loss" : p1Result === "loss" ? "win" : "tie";
+
+	const makeRow = (
+		player: typeof player1,
+		opponent: typeof player2,
+		result: "win" | "loss" | "tie",
+	) => ({
+		user_id: player.userId,
+		opponent_id: opponent.userId,
+		match_type: matchType,
+		result,
+		elapsed_ms: player.data.elapsedMs,
+		accuracy: player.data.accuracy,
+		correct: player.data.correct,
+		incorrect: player.data.incorrect,
+		incomplete: player.data.incomplete,
+		elo_before: player.oldElo,
+		elo_after: player.newElo,
+		elo_change: player.oldElo != null && player.newElo != null ? player.newElo - player.oldElo : null,
+		opponent_display_name: opponent.displayName,
+		opponent_accuracy: opponent.data.accuracy,
+		opponent_elapsed_ms: opponent.data.elapsedMs,
+	});
+
+	supabaseAdmin
+		.from("match_history")
+		.insert([
+			makeRow(player1, player2, p1Result),
+			makeRow(player2, player1, p2Result),
+		])
+		.then(({ error }) => {
+			if (error) {
+				console.error(`[CARS Ranked] Failed to write match history:`, error.message);
+			} else {
+				console.log(`[CARS Ranked] Match history written for ${player1.userId} vs ${player2.userId}`);
+			}
+		});
+}
+
 // Check if room has 0 users (true if 0)
 function isEmpty(room: string) {
 	return (io.sockets.adapter.rooms.get(room)?.size ?? 0) === 0;
@@ -751,6 +814,26 @@ io.sockets.on("connection", (socket) => {
 				});
 
 				roomEloResults.delete(roomId);
+
+				// Write match history (fire-and-forget)
+				const firstUser = socketUser.get(firstSid);
+				const secondUser = socketUser.get(secondSid);
+				if (firstUser && secondUser) {
+					writeMatchHistory(roomMatchType, {
+						userId: firstUser.userId,
+						displayName: firstElo?.displayName ?? firstUser.displayName,
+						data: firstData,
+						oldElo: firstElo?.oldElo ?? null,
+						newElo: firstElo?.newElo ?? null,
+					}, {
+						userId: secondUser.userId,
+						displayName: secondElo?.displayName ?? secondUser.displayName,
+						data: secondData,
+						oldElo: secondElo?.oldElo ?? null,
+						newElo: secondElo?.newElo ?? null,
+					});
+				}
+
 				console.log(`[CARS Ranked] Results sent for room ${roomId} (early ELO path)`);
 			} else if (isCasual) {
 				// Casual mode: no ELO changes — fetch profiles read-only for display
@@ -795,6 +878,25 @@ io.sockets.on("connection", (socket) => {
 						opponentNewRank: opProfile ? getRank(opProfile.elo) : null,
 					});
 				}
+				// Write match history (fire-and-forget)
+				if (user1 && user2) {
+					const p1Profile = profiles.find((p) => p.id === user1.userId);
+					const p2Profile = profiles.find((p) => p.id === user2.userId);
+					writeMatchHistory(roomMatchType, {
+						userId: user1.userId,
+						displayName: p1Profile?.display_name ?? user1.displayName,
+						data: entries[0][1],
+						oldElo: p1Profile?.elo ?? null,
+						newElo: p1Profile?.elo ?? null,
+					}, {
+						userId: user2.userId,
+						displayName: p2Profile?.display_name ?? user2.displayName,
+						data: entries[1][1],
+						oldElo: p2Profile?.elo ?? null,
+						newElo: p2Profile?.elo ?? null,
+					});
+				}
+
 				console.log(`[CARS Ranked] Casual results sent for room ${roomId} (no ELO change)`);
 			} else {
 				// Ranked: both finished, process ELO now
@@ -831,6 +933,27 @@ io.sockets.on("connection", (socket) => {
 						opponentNewRank: opElo?.newRank ?? null,
 					});
 				}
+				// Write match history (fire-and-forget)
+				const u1 = socketUser.get(entries[0][0]);
+				const u2 = socketUser.get(entries[1][0]);
+				if (u1 && u2) {
+					const elo1 = eloResults?.[entries[0][0]];
+					const elo2 = eloResults?.[entries[1][0]];
+					writeMatchHistory(roomMatchType, {
+						userId: u1.userId,
+						displayName: elo1?.displayName ?? u1.displayName,
+						data: entries[0][1],
+						oldElo: elo1?.oldElo ?? null,
+						newElo: elo1?.newElo ?? null,
+					}, {
+						userId: u2.userId,
+						displayName: elo2?.displayName ?? u2.displayName,
+						data: entries[1][1],
+						oldElo: elo2?.oldElo ?? null,
+						newElo: elo2?.newElo ?? null,
+					});
+				}
+
 				console.log(`[CARS Ranked] Results + ELO sent for room ${roomId}`);
 			}
 		} else {
