@@ -20,7 +20,7 @@ const ALLOWED_ORIGINS = [
 const io = new Server({
 	cors: {
 		origin: (origin, callback) => {
-			if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+			if (!origin || ALLOWED_ORIGINS.includes(origin) || origin.startsWith("chrome-extension://")) {
 				callback(null, true);
 			} else {
 				callback(new Error("CORS origin not allowed"));
@@ -186,6 +186,20 @@ function computeNewElo(currentElo: number, won: boolean): number {
 	return Math.max(472, Math.min(528, newElo));
 }
 
+function determineResult(
+	p1: PlayerFinishData,
+	p2: PlayerFinishData,
+): "p1" | "p2" | "tie" {
+	const acc1 = p1.accuracy ?? -1;
+	const acc2 = p2.accuracy ?? -1;
+
+	if (acc1 > acc2) return "p1";
+	if (acc2 > acc1) return "p2";
+	if (p1.elapsedMs < p2.elapsedMs) return "p1";
+	if (p2.elapsedMs < p1.elapsedMs) return "p2";
+	return "tie";
+}
+
 async function processEloUpdate(
 	player1: { socketId: string; data: PlayerFinishData },
 	player2: { socketId: string; data: PlayerFinishData },
@@ -205,27 +219,10 @@ async function processEloUpdate(
 	const profile2 = profiles.find((p) => p.id === user2.userId)!;
 
 	// Determine winner: PRIMARY = higher accuracy, TIEBREAKER = faster time
-	const acc1 = player1.data.accuracy ?? 0;
-	const acc2 = player2.data.accuracy ?? 0;
-
-	let p1Won = false;
-	let p2Won = false;
-	let isTie = false;
-
-	if (acc1 > acc2) {
-		p1Won = true;
-	} else if (acc2 > acc1) {
-		p2Won = true;
-	} else {
-		// Equal accuracy — tiebreak by time (lower is better)
-		if (player1.data.elapsedMs < player2.data.elapsedMs) {
-			p1Won = true;
-		} else if (player2.data.elapsedMs < player1.data.elapsedMs) {
-			p2Won = true;
-		} else {
-			isTie = true;
-		}
-	}
+	const result = determineResult(player1.data, player2.data);
+	const isTie = result === "tie";
+	const p1Won = result === "p1";
+	const p2Won = result === "p2";
 
 	const newElo1 = isTie ? profile1.elo : computeNewElo(profile1.elo, p1Won);
 	const newElo2 = isTie ? profile2.elo : computeNewElo(profile2.elo, p2Won);
@@ -310,22 +307,9 @@ function writeMatchHistory(
 	player1: { userId: string; displayName: string; data: PlayerFinishData; oldElo: number | null; newElo: number | null },
 	player2: { userId: string; displayName: string; data: PlayerFinishData; oldElo: number | null; newElo: number | null },
 ) {
-	const acc1 = player1.data.accuracy ?? 0;
-	const acc2 = player2.data.accuracy ?? 0;
-
-	let p1Result: "win" | "loss" | "tie";
-	if (acc1 > acc2) {
-		p1Result = "win";
-	} else if (acc2 > acc1) {
-		p1Result = "loss";
-	} else if (player1.data.elapsedMs < player2.data.elapsedMs) {
-		p1Result = "win";
-	} else if (player2.data.elapsedMs < player1.data.elapsedMs) {
-		p1Result = "loss";
-	} else {
-		p1Result = "tie";
-	}
-	const p2Result = p1Result === "win" ? "loss" : p1Result === "loss" ? "win" : "tie";
+	const result = determineResult(player1.data, player2.data);
+	const p1Result: "win" | "loss" | "tie" = result === "p1" ? "win" : result === "p2" ? "loss" : "tie";
+	const p2Result: "win" | "loss" | "tie" = result === "p1" ? "loss" : result === "p2" ? "win" : "tie";
 
 	const makeRow = (
 		player: typeof player1,
@@ -770,6 +754,10 @@ io.sockets.on("connection", (socket) => {
 			// Check if ELO was already processed (100% early finish case)
 			const preComputedElo = roomEloResults.get(roomId);
 
+			type HistoryPlayer = { userId: string; displayName: string; data: PlayerFinishData; oldElo: number | null; newElo: number | null };
+			let historyP1: HistoryPlayer | null = null;
+			let historyP2: HistoryPlayer | null = null;
+
 			if (preComputedElo) {
 				// ELO already computed for this room (first player got 100%)
 				const secondSid = socket.id;
@@ -815,23 +803,24 @@ io.sockets.on("connection", (socket) => {
 
 				roomEloResults.delete(roomId);
 
-				// Write match history (fire-and-forget)
+				// Collect match history data
 				const firstUser = socketUser.get(firstSid);
 				const secondUser = socketUser.get(secondSid);
 				if (firstUser && secondUser) {
-					writeMatchHistory(roomMatchType, {
+					historyP1 = {
 						userId: firstUser.userId,
 						displayName: firstElo?.displayName ?? firstUser.displayName,
 						data: firstData,
 						oldElo: firstElo?.oldElo ?? null,
 						newElo: firstElo?.newElo ?? null,
-					}, {
+					};
+					historyP2 = {
 						userId: secondUser.userId,
 						displayName: secondElo?.displayName ?? secondUser.displayName,
 						data: secondData,
 						oldElo: secondElo?.oldElo ?? null,
 						newElo: secondElo?.newElo ?? null,
-					});
+					};
 				}
 
 				console.log(`[CARS Ranked] Results sent for room ${roomId} (early ELO path)`);
@@ -878,23 +867,24 @@ io.sockets.on("connection", (socket) => {
 						opponentNewRank: opProfile ? getRank(opProfile.elo) : null,
 					});
 				}
-				// Write match history (fire-and-forget)
+				// Collect match history data
 				if (user1 && user2) {
 					const p1Profile = profiles.find((p) => p.id === user1.userId);
 					const p2Profile = profiles.find((p) => p.id === user2.userId);
-					writeMatchHistory(roomMatchType, {
+					historyP1 = {
 						userId: user1.userId,
 						displayName: p1Profile?.display_name ?? user1.displayName,
 						data: entries[0][1],
 						oldElo: p1Profile?.elo ?? null,
 						newElo: p1Profile?.elo ?? null,
-					}, {
+					};
+					historyP2 = {
 						userId: user2.userId,
 						displayName: p2Profile?.display_name ?? user2.displayName,
 						data: entries[1][1],
 						oldElo: p2Profile?.elo ?? null,
 						newElo: p2Profile?.elo ?? null,
-					});
+					};
 				}
 
 				console.log(`[CARS Ranked] Casual results sent for room ${roomId} (no ELO change)`);
@@ -933,28 +923,34 @@ io.sockets.on("connection", (socket) => {
 						opponentNewRank: opElo?.newRank ?? null,
 					});
 				}
-				// Write match history (fire-and-forget)
+				// Collect match history data
 				const u1 = socketUser.get(entries[0][0]);
 				const u2 = socketUser.get(entries[1][0]);
 				if (u1 && u2) {
 					const elo1 = eloResults?.[entries[0][0]];
 					const elo2 = eloResults?.[entries[1][0]];
-					writeMatchHistory(roomMatchType, {
+					historyP1 = {
 						userId: u1.userId,
 						displayName: elo1?.displayName ?? u1.displayName,
 						data: entries[0][1],
 						oldElo: elo1?.oldElo ?? null,
 						newElo: elo1?.newElo ?? null,
-					}, {
+					};
+					historyP2 = {
 						userId: u2.userId,
 						displayName: elo2?.displayName ?? u2.displayName,
 						data: entries[1][1],
 						oldElo: elo2?.oldElo ?? null,
 						newElo: elo2?.newElo ?? null,
-					});
+					};
 				}
 
 				console.log(`[CARS Ranked] Results + ELO sent for room ${roomId}`);
+			}
+
+			// Write match history (fire-and-forget) — single call for all paths
+			if (historyP1 && historyP2) {
+				writeMatchHistory(roomMatchType, historyP1, historyP2);
 			}
 		} else {
 			// First player finished — check for 100% guaranteed win
