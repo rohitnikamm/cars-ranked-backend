@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 CARS Ranked Backend is a Node.js server that provides HTTP REST API and Socket.io WebSocket functionality for the CARS Ranked browser extension. It manages ELO-filtered matchmaking, room creation, passage synchronization, and real-time user coordination for MCAT CARS study sessions.
 
-**Purpose**: Coordinate matchmaking (±15 ELO-filtered for ranked, first-come-first-served for casual) and synchronized passage selection between multiple browser extension clients. Server fetches ELO from Supabase (tamper-proof) and enforces a 30-second matchmaking timeout. Ranked mode applies ELO gain/loss; casual mode skips all ELO processing.
+**Purpose**: Coordinate matchmaking (±15 ELO-filtered for ranked, first-come-first-served for casual) and synchronized passage selection between multiple browser extension clients. Server fetches ELO from Supabase (tamper-proof) and enforces mode-specific matchmaking timeouts (30s ranked, 5min casual). Ranked mode applies ELO gain/loss; casual mode skips all ELO processing.
 
 ---
 
@@ -160,12 +160,12 @@ type WaitingEntry = {
     elo: number;                // Player's ELO (fetched server-side from Supabase)
     matchType: MatchType;       // "ranked" (±15 ELO filter) or "casual" (no filter)
     isTest: boolean;            // Test user flag — test users only match with other test users
-    timeoutHandle: ReturnType<typeof setTimeout>;  // 30s matchmake timeout
+    timeoutHandle: ReturnType<typeof setTimeout>;  // matchmake timeout (30s ranked, 5min casual)
 };
 ```
 
 **Lifecycle**:
-- Created when no compatible room exists during `matchmake` → starts 30s timeout
+- Created when no compatible room exists during `matchmake` → starts mode-specific timeout (30s ranked, 5min casual)
 - Consumed when a compatible player matches → `clearTimeout` + delete entry
 - Deleted + `clearTimeout` on: `cancelMatchmake`, `disconnect`, timeout expiry, periodic sweeper
 
@@ -307,7 +307,7 @@ NTP-style clock synchronization. Client sends its local timestamp; server echoes
 
 #### Client → Server: `matchmake`
 
-Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30s timeout. Ranked uses ±15 ELO filter; casual uses first-come-first-served (no ELO filter).
+Auto-matchmaking: finds a compatible waiting room or creates a new one with a mode-specific timeout (30s ranked, 5min casual). Ranked uses ±15 ELO filter; casual uses first-come-first-served (no ELO filter).
 
 **Payload**: `{ userId?: string, displayName?: string, matchType?: MatchType }` — user identity for ELO tracking (stored in `socketUser` map); `matchType` defaults to `"ranked"`
 
@@ -336,12 +336,12 @@ Auto-matchmaking: finds a compatible waiting room or creates a new one with a 30
 10. If no compatible room:
    - Create new 10-char alphanumeric room code, socket.join(room)
    - roomMatchTypes.set(code, matchType) — track match type for ELO gating
-   - Start 30s timeout → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
+   - Start mode-specific timeout (30s ranked, 5min casual) → on expiry: emit "matchmakeTimeout" { roomId }, clean up room
    - Store WaitingEntry { socketId, elo, matchType, isTest, timeoutHandle } in waitingRooms
    - emit "waiting" { roomId }
 ```
 
-**Constants**: `ROOM_MAX_CAPACITY = 2`, `COUNTDOWN_MS = 5000`, `MATCHMAKE_TIMEOUT_MS = 30_000`, `ELO_RANGE = 15`
+**Constants**: `ROOM_MAX_CAPACITY = 2`, `COUNTDOWN_MS = 5000`, `MATCHMAKE_TIMEOUT_MS = 30_000`, `CASUAL_MATCHMAKE_TIMEOUT_MS = 300_000`, `ELO_RANGE = 15`
 
 ---
 
@@ -367,7 +367,7 @@ Emitted to both players when a room becomes full.
 
 #### Server → Client: `waiting`
 
-Emitted when no compatible waiting room exists; player is waiting for an opponent. A 30s server-side timeout starts.
+Emitted when no compatible waiting room exists; player is waiting for an opponent. A mode-specific server-side timeout starts (30s ranked, 5min casual).
 
 **Payload**: `{ roomId: string }`
 
@@ -375,7 +375,7 @@ Emitted when no compatible waiting room exists; player is waiting for an opponen
 
 #### Server → Client: `matchmakeTimeout`
 
-Emitted when 30 seconds elapse with no compatible match found (±15 ELO for ranked, any player for casual). Server cleans up the room, socket leaves room, and all maps are cleared.
+Emitted when the matchmaking timeout expires (30s for ranked, 5min for casual) with no compatible match found. Server cleans up the room, socket leaves room, and all maps are cleared.
 
 **Payload**: `{ roomId: string }`
 

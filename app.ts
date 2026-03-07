@@ -35,6 +35,7 @@ io.attachApp(app);
 const ROOM_MAX_CAPACITY = 2;
 const COUNTDOWN_MS = 5000;
 const MATCHMAKE_TIMEOUT_MS = 30_000;
+const CASUAL_MATCHMAKE_TIMEOUT_MS = 300_000; // 5 minutes
 const ELO_RANGE = 15;
 
 // Match types (ranked = ELO-filtered, casual = first-come-first-served)
@@ -629,7 +630,8 @@ io.sockets.on("connection", (socket) => {
 				socketRoom.set(socket.id, code);
 				roomMatchTypes.set(code, matchType);
 
-				// Start timeout — if no match found within MATCHMAKE_TIMEOUT_MS, notify client
+				// Start timeout — if no match found within timeout, notify client
+				const timeoutMs = matchType === "casual" ? CASUAL_MATCHMAKE_TIMEOUT_MS : MATCHMAKE_TIMEOUT_MS;
 				const timeoutHandle = setTimeout(() => {
 					socket.emit("matchmakeTimeout", { roomId: code });
 					socket.leave(code);
@@ -637,9 +639,9 @@ io.sockets.on("connection", (socket) => {
 					socketUser.delete(socket.id);
 					waitingRooms.delete(code);
 					console.log(
-						`[CARS Ranked] Matchmake timeout: ${socket.id} in room ${code} after ${MATCHMAKE_TIMEOUT_MS}ms`,
+						`[CARS Ranked] Matchmake timeout: ${socket.id} in room ${code} after ${timeoutMs}ms`,
 					);
-				}, MATCHMAKE_TIMEOUT_MS);
+				}, timeoutMs);
 
 				waitingRooms.set(code, { socketId: socket.id, elo: playerElo, matchType, isTest: playerIsTest, timeoutHandle });
 
