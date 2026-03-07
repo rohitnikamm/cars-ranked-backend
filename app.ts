@@ -14,13 +14,12 @@ const supabaseAdmin = createClient(
 
 const app = App();
 const ALLOWED_ORIGINS = [
-	"chrome-extension://lphcjalbgllpmnocjhhgimfkmefjheif", // Dev
-	"chrome-extension://hokcincgnecdhjpnomajaafblpbfpmjb", // Prod
+	"chrome-extension://gemfgidajmobibjlnhehbjglemnnihmo",
 ];
 const io = new Server({
 	cors: {
 		origin: (origin, callback) => {
-			if (!origin || ALLOWED_ORIGINS.includes(origin) || origin.startsWith("chrome-extension://")) {
+			if (!origin || ALLOWED_ORIGINS.includes(origin)) {
 				callback(null, true);
 			} else {
 				callback(new Error("CORS origin not allowed"));

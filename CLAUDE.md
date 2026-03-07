@@ -629,17 +629,16 @@ PLASMO_PUBLIC_SOCKET_ENDPOINT="http://localhost:<NEW_PORT>"
 
 ### CORS
 
-Socket.io CORS accepts any `chrome-extension://` origin, plus explicit dev/prod IDs in `ALLOWED_ORIGINS`. This is necessary because Chrome unpacked extension IDs are derived from the directory path on disk — different machines get different IDs (no manifest `key` field).
+Socket.io CORS is restricted to the deterministic extension ID derived from the manifest `key` field. All installations share the same ID (`gemfgidajmobibjlnhehbjglemnnihmo`) regardless of machine or directory.
 
 ```typescript
 const ALLOWED_ORIGINS = [
-    "chrome-extension://lphcjalbgllpmnocjhhgimfkmefjheif", // Dev
-    "chrome-extension://hokcincgnecdhjpnomajaafblpbfpmjb", // Prod
+    "chrome-extension://gemfgidajmobibjlnhehbjglemnnihmo",
 ];
 const io = new Server({
     cors: {
         origin: (origin, callback) => {
-            if (!origin || ALLOWED_ORIGINS.includes(origin) || origin.startsWith("chrome-extension://")) {
+            if (!origin || ALLOWED_ORIGINS.includes(origin)) {
                 callback(null, true);
             } else {
                 callback(new Error("CORS origin not allowed"));
@@ -650,8 +649,6 @@ const io = new Server({
     },
 });
 ```
-
-**Note**: For production, consider adding a fixed `key` to the extension manifest so all builds share the same extension ID, then tighten CORS back to explicit IDs only.
 
 ### Room Limits
 
@@ -866,9 +863,8 @@ lsof -ti:3000 | xargs kill -9  # Kill process on port 3000
 
 **CORS errors**:
 
-- CORS accepts any `chrome-extension://` origin plus explicit IDs in `ALLOWED_ORIGINS`. If you see 400 errors on WebSocket handshake, the origin is likely not a `chrome-extension://` URL.
+- CORS is restricted to the deterministic extension ID `gemfgidajmobibjlnhehbjglemnnihmo`. If you see 400 errors on WebSocket handshake, the extension may not have the manifest `key` field (rebuild required).
 - Check browser background console for repeated "Unexpected response code: 400" on the WebSocket URL — this is a CORS rejection symptom.
-- Chrome unpacked extension IDs differ across machines (derived from directory path). The current CORS config handles this by allowing all `chrome-extension://` origins.
 
 **Room not found (404)**:
 
@@ -1007,7 +1003,7 @@ npm run build:full   # Compile + upload Sentry sourcemaps
 
 ### Current Security Posture
 
-- **CORS**: Accepts any `chrome-extension://` origin (necessary for cross-machine dev builds with different unpacked extension IDs). For production, consider adding a manifest `key` and restricting to explicit IDs only.
+- **CORS**: Restricted to the deterministic extension ID `gemfgidajmobibjlnhehbjglemnnihmo` (from manifest `key` field). All installations share this ID.
 - **Rate limiting**: Per-socket rate limiting (5 events per 10s window) on `matchmake` and `playerFinished` events. Expired entries cleaned up by periodic 60s sweeper.
 - **Input validation**: `playerFinished` data validated (accuracy 0-100, elapsedMs max 4h, non-negative integers for correct/incorrect/incomplete). `matchType` validated against `["ranked", "casual"]`. `roomId` format validated on HTTP endpoints (`/^[A-Za-z0-9]{5,12}$/`). `frameIds` validated as array with max 20 items. `passageId` validated as string with max 200 chars.
 - **Room code entropy**: 10-character alphanumeric codes (62^10 ≈ 8.4×10^17 combinations), generated with `crypto.randomBytes`
